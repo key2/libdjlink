@@ -426,6 +426,53 @@ tolerate:
   5/6 kick themselves off the network.
 - A9 emits a 100-byte *paired* keep-alive naming both itself and the Stagehand peer.
 
+### 1.11 rekordbox EXPORT / LINK — measured (2026-08-27)
+
+First-party observations from `captures/` (a pcap taken **on** a Windows rekordbox
+host, so its own unicast is visible). rekordbox ran as device `0x11`, two
+`CDJ-3000X` players (1, 2) and a `DJM-A9` (33) present. These behaviours are not
+in the dysentery analysis and are **not yet handled** by the library beyond being
+surfaced as `DJL_EV_UNKNOWN_PACKET`.
+
+**Two big structural facts:**
+
+1. **No dbserver (TCP) traffic at all.** When the collection source is rekordbox
+   (rather than another CDJ's USB), the players do **not** use the `dbserver`
+   TCP protocol. Metadata/art/tracks come over **NFS** plus a set of UDP control
+   packets (below). dbserver is the CDJ↔CDJ mechanism; NFS+UDP is the
+   rekordbox↔CDJ mechanism.
+2. **rekordbox is the NFS *server*; the CDJs are the clients** — the reverse of
+   reading a CDJ's USB. The CDJs `GETPORT` (portmap 111) for `mount` (100005)
+   and `nfs` (100003) on the rekordbox host, `MNT` its export (path `/`, mount
+   status 0 = success), and `LOOKUP` files. **NFS filenames are UTF-16LE**
+   (e.g. `LOOKUP "rekordbox_customimage.jpeg"`, `"PIONEER"`), unlike the
+   byte-string names used elsewhere. In this capture the visible NFS activity is
+   the CDJs pulling rekordbox's custom on-air display image; a track load from
+   the collection would additionally `READ` the exported audio and PDB/ANLZ.
+
+**New UDP packet kinds on port 50002** (all carry the standard magic + name;
+`body` starts at `0x1f` = `01`, subtype, `Dr`, `len_r`, payload):
+
+| Kind | Dir | Len | Notes |
+|---|---|---|---|
+| `0x11` | rekordbox→CDJ | 296 | rekordbox announce; payload contains the **host computer name in UTF-16LE** (the "DESKTOP-…" shown when browsing rekordbox on a player). Pairs with the `0x10` hello. |
+| `0x16` | rekordbox→CDJ | 48 | small periodic control/keepalive to each player (mostly zero payload) |
+| `0x30` | mixer→rekordbox | 36 | DJM-A9 → rekordbox notification |
+| `0x31` | rekordbox→mixer | 44 | rekordbox → DJM-A9 (paired with `0x30`) |
+| `0x46` | CDJ→rekordbox | 40 | short reply to `0x47` (`…020400a0`) |
+| `0x47` | rekordbox→CDJ | 72 | request/config; payload carries the `12 34 56 78` settings marker + an `01`-run — looks like a settings/capability exchange |
+| `0x80` | CDJ→rekordbox | 44 | player → rekordbox notification, references rekordbox's device number `0x11` |
+
+**Consequences for the library:**
+- To *observe* a rekordbox-linked network fully, classify these seven kinds
+  (currently `UNKNOWN`) and decode at least `0x11` (source name) and the
+  `0x46/0x47` pair.
+- To *act as rekordbox* (serve a collection to players), the library would need
+  an **NFS + mount + portmap server** with UTF-16LE filename handling and the
+  above UDP control channel — a whole subsystem beyond the NFS *client* planned
+  for reading CDJ USBs. This is the single largest capability gap surfaced by
+  the capture.
+
 ---
 
 ## 2. Layered architecture
@@ -1216,7 +1263,9 @@ live CDJ-3000X / DJM-A9 rig; **[built]** implemented, not yet hardware-verified;
 | NFS + `export.pdb` + ANLZ | **[todo]** step 9 | complete |
 | Device Library Plus (`exportLibrary.db`) | parse if a key is supplied | **encrypted; key not public** |
 | Opus Quad / XDJ-AZ via rekordbox-Lighting + PSSI matching | **[todo]** step 10 | mostly complete |
-| Touch Audio (`0x1e`/`0x1f`/`0x20`) | **[built]** timing rx decoded; PCM **[todo]** | complete |
+| rekordbox EXPORT NFS *server* (CDJs mount us) + UTF-16LE names | **[todo]** whole subsystem, see §1.11 | observed 2026-08-27 |
+| rekordbox link UDP control (`0x11`,`0x16`,`0x30`,`0x31`,`0x46`,`0x47`,`0x80`) | **[todo]** surfaced as unknown; decode `0x11` name first | observed, undocumented |
+| Touch Audio (`0x1e`/`0x1f`/`0x20`) | **[built]** timing rx decoded (122k pkts seen); PCM **[todo]** | complete |
 | Streaming tracks (Beatport LINK, Cloud Direct Play) | metadata + waveforms; no grid/cues | protocol-limited |
 | DJM-A9 mixer state (`0x39`) per-channel | expose decoded fields, raw block for the rest | master/FX block **undecoded** |
 | A9 VU stream (`0x58`) | expose raw | **hypothesis only** |
