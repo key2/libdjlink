@@ -955,6 +955,13 @@ int djl_waveform_segment_count(const djl_waveform_blob *wf)
     return es ? (int)(wf->length / es) : 0;
 }
 
+int djl_waveform_max_height(const djl_waveform_blob *wf)
+{
+    int n = djl_waveform_segment_count(wf), mx = 1;
+    for (int i = 0; i < n; i++) { int h = djl_waveform_height(wf, i); if (h > mx) mx = h; }
+    return mx;
+}
+
 int djl_waveform_height(const djl_waveform_blob *wf, int seg)
 {
     if (!wf || !wf->data || seg < 0) return 0;
@@ -962,14 +969,16 @@ int djl_waveform_height(const djl_waveform_blob *wf, int seg)
     uint32_t base = (uint32_t)seg * es;
     if (base + es > wf->length) return 0;
     const uint8_t *p = wf->data + base;
+    /* Height ranges differ by style: blue is 0-31 (5 bits), RGB and 3-band are
+     * raw unsigned bytes. Callers should normalise (see djl_waveform_max_height). */
     switch (wf->style) {
     case DJL_WAVE_BLUE:
-        return wf->detail ? (p[0] & 0x1f) : (p[0] & 0x1f);
+        return p[0] & 0x1f;
     case DJL_WAVE_RGB:
         if (wf->detail) { uint16_t v = (uint16_t)((p[0]<<8)|p[1]); return (v >> 2) & 0x1f; }
-        else { int r=p[3],g=p[4],b=p[5]; int m=r>g?r:g; m=m>b?m:b; return m>31?31:m; }
+        else { int r=p[3],g=p[4],b=p[5]; int m=r>g?r:g; return m>b?m:b; }  /* back envelope */
     case DJL_WAVE_THREE_BAND: {
-        int mid=p[0],hi=p[1],lo=p[2]; int m=mid>hi?mid:hi; m=m>lo?m:lo; return m>31?31:m;
+        int mid=p[0],hi=p[1],lo=p[2]; int m=mid>hi?mid:hi; return m>lo?m:lo;
     }
     }
     return 0;
@@ -987,7 +996,10 @@ void djl_waveform_rgb(const djl_waveform_blob *wf, int seg, uint8_t *r, uint8_t 
             case DJL_WAVE_RGB:
                 if (wf->detail) { uint16_t v=(uint16_t)((p[0]<<8)|p[1]);
                     rr=(uint8_t)(((v>>13)&7)*36); gg=(uint8_t)(((v>>10)&7)*36); bb=(uint8_t)(((v>>7)&7)*36); }
-                else { rr=(uint8_t)(p[3]*8); gg=(uint8_t)(p[4]*8); bb=(uint8_t)(p[5]*8); }
+                else {  /* red/green/blue at p[3..5], scaled by the back height (beat-link) */
+                    int back = p[3] > p[4] ? p[3] : p[4]; if (p[5] > back) back = p[5];
+                    if (back > 0) { rr=(uint8_t)(p[3]*255/back); gg=(uint8_t)(p[4]*255/back); bb=(uint8_t)(p[5]*255/back); }
+                }
                 break;
             case DJL_WAVE_THREE_BAND:   /* mid=amber, high=white, low=blue */
                 rr=(uint8_t)((p[0] + p[1]) > 31 ? 255 : (p[0]+p[1])*8);

@@ -627,7 +627,10 @@ DJL_API void    djl_waveform_free(djl_waveform_blob *wf);
 
 /* Sample height 0..? and color of one waveform segment, decoded per style. */
 DJL_API int     djl_waveform_segment_count(const djl_waveform_blob *wf);
-DJL_API int     djl_waveform_height(const djl_waveform_blob *wf, int segment); /* 0..31 */
+/* Segment height. Range is 0..31 for blue; RGB/3-band are raw unsigned bytes,
+ * so normalise against djl_waveform_max_height() for display. */
+DJL_API int     djl_waveform_height(const djl_waveform_blob *wf, int segment);
+DJL_API int     djl_waveform_max_height(const djl_waveform_blob *wf);
 DJL_API void    djl_waveform_rgb(const djl_waveform_blob *wf, int segment,
                                  uint8_t *r, uint8_t *g, uint8_t *b);
 

@@ -34,6 +34,8 @@ static void render_waveform(const djl_waveform_blob *wf, int cols)
     if (n <= 0) { printf("  (no waveform segments)\n"); return; }
     const char *ramp = " .:-=+*#%@";
     int rows = 8;
+    int maxh = djl_waveform_max_height(wf);       /* normalise across styles */
+    if (maxh < 1) maxh = 1;
     /* Downsample to cols columns, take the peak height in each bucket. */
     for (int row = rows; row >= 1; row--) {
         printf("  ");
@@ -45,7 +47,7 @@ static void render_waveform(const djl_waveform_blob *wf, int cols)
                 int h = djl_waveform_height(wf, (int)i);
                 if (h > peak) peak = h;
             }
-            int level = peak * rows / 31;          /* 0..rows */
+            int level = peak * rows / maxh;        /* 0..rows */
             putchar(level >= row ? ramp[9] : ' ');
         }
         putchar('\n');
