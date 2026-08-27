@@ -17,6 +17,8 @@ int djl_test_checks = 0;
 
 /* Implemented in test_nfs.c: NFS/RPC/XDR, PDB and ANLZ codecs. */
 void djl_test_nfs(void);
+/* Implemented in test_position.c: beat-grid position tracking. */
+void djl_test_position(void);
 
 #define CHECK(cond, ...) do {                            \
     checks++;                                            \
@@ -673,6 +675,7 @@ int main(void)
     test_cue_color_lut();
     test_fuzz_no_crash();
     djl_test_nfs();
+    djl_test_position();
 
     printf("\n%d checks, %d failure(s)\n", checks, failures);
     return failures ? 1 : 0;

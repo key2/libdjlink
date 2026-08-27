@@ -26,6 +26,25 @@ static void entry_clear(struct djl_meta_entry *e)
     memset(e, 0, sizeof *e);
 }
 
+/* The position tracker borrows the cached grid rather than copying it, so every
+ * change to the cache entry has to be reflected here while the lock is held. */
+void djl_pos_attach_grid(djl_context *ctx, uint8_t player)
+{
+    if (!ctx || player == 0 || player >= 64) return;
+    djl_pos_state *ps = &ctx->positions[player];
+    const djl_beat_grid *g = NULL;
+    if (ctx->meta_cache && ctx->meta_cache[player].valid &&
+        ctx->meta_cache[player].has_grid && ctx->meta_cache[player].grid.count)
+        g = &ctx->meta_cache[player].grid;
+    if (ps->grid != g) {
+        ps->grid = g;
+        ps->grid_gen++;
+        /* A new track invalidates any position we extrapolated for the old one;
+         * the next status packet re-anchors us against the new grid. */
+        ps->grid_beat_known = false;
+    }
+}
+
 /* ---- worker ---- */
 
 static void emit_note(djl_context *ctx, djl_event_kind kind, uint8_t player,
@@ -249,6 +268,10 @@ static void perform_fetch(djl_context *ctx, uint8_t player, uint8_t host,
         if (has_sig)  { e->has_sig  = true; memcpy(e->sig, sig, 20); }
         if (has_ss)   { e->has_ss   = true; e->ss   = ss; }
 
+        /* Hand the fresh grid to the position tracker: this is what gives
+         * pre-CDJ-3000 players an absolute playhead. */
+        djl_pos_attach_grid(ctx, player);
+
         djl_log(ctx, DJL_LOG_INFO,
                 "metadata p%u id=%u: %s%s%s%s%s%s", player, id,
                 has_meta ? "meta " : "", has_wave ? "wave " : "",
@@ -376,11 +399,19 @@ void djl_meta_stop(djl_context *ctx)
     pthread_join(ctx->meta_thread, NULL);
     ctx->meta_started = false;
 
+    /* The position trackers borrow grids out of this cache, so drop those
+     * references before the storage goes away. */
+    pthread_mutex_lock(&ctx->lock);
+    for (int i = 0; i < 64; i++) {
+        ctx->positions[i].grid = NULL;
+        ctx->positions[i].grid_beat_known = false;
+    }
     if (ctx->meta_cache) {
         for (int i = 0; i < 64; i++) entry_clear(&ctx->meta_cache[i]);
         free(ctx->meta_cache);
         ctx->meta_cache = NULL;
     }
+    pthread_mutex_unlock(&ctx->lock);
     pthread_cond_destroy(&ctx->meta_cond);
 }
 

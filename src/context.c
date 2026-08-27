@@ -181,6 +181,10 @@ static void roster_expire(djl_context *ctx, uint64_t now)
             ev.u.device_lost = e->info;
             djl_emit(ctx, &ev);
             if (ctx->tempo_master == e->info.number) ctx->tempo_master = 0;
+            /* Forget where a device that has gone away was playing. */
+            if (e->info.number < 64)
+                memset(&ctx->positions[e->info.number], 0,
+                       sizeof ctx->positions[e->info.number]);
             memset(e, 0, sizeof *e);
         }
     }
@@ -893,11 +897,13 @@ void djl_context_stop(djl_context *ctx)
 {
     if (!ctx || !ctx->running) return;
     ctx->running = false;
-    djl_meta_stop(ctx);
+    /* Join the I/O thread before the metadata cache is torn down: the position
+     * trackers it drives hold borrowed pointers into that cache. */
     if (ctx->thread_started) {
         pthread_join(ctx->thread, NULL);
         ctx->thread_started = false;
     }
+    djl_meta_stop(ctx);
     djl_sock_close(&ctx->sock_announce);
     djl_sock_close(&ctx->sock_beat);
     djl_sock_close(&ctx->sock_status);

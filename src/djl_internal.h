@@ -116,7 +116,19 @@ typedef struct {
     bool     definitive;       /* last update was precise position or a beat */
     bool     from_precise;
     int64_t  track_length_ms;  /* -1 if unknown */
+
+    /* Beat-grid anchoring, for players with no precise-position stream.
+     * The grid itself lives in the metadata cache and is refreshed here by
+     * generation counter so position.c never has to own or free it. */
+    const djl_beat_grid *grid;
+    uint32_t grid_gen;         /* bumped whenever the cached grid is replaced */
+    bool     grid_beat_known;  /* last beat number came from a status packet */
 } djl_pos_state;
+
+/* Beat-grid helpers (pure). */
+int64_t djl_grid_time_of_beat(const djl_beat_grid *g, int32_t beat);
+int32_t djl_grid_beat_at_time(const djl_beat_grid *g, int64_t ms);
+uint8_t djl_grid_beat_within_bar(const djl_beat_grid *g, int32_t beat);
 
 void djl_pos_apply_precise(djl_pos_state *s, const djl_precise_position *pp, uint64_t now);
 void djl_pos_apply_beat(djl_pos_state *s, const djl_beat *b, uint64_t now);
@@ -215,5 +227,8 @@ djl_err djl_meta_start(djl_context *ctx);
 void    djl_meta_stop(djl_context *ctx);
 void    djl_meta_enqueue(djl_context *ctx, uint8_t player, uint8_t host,
                          djl_slot slot, djl_track_type type, uint32_t id);
+/* Point a player's position tracker at its cached beat grid, or clear it when
+ * the cache no longer holds one. Caller must hold ctx->lock. */
+void    djl_pos_attach_grid(djl_context *ctx, uint8_t player);
 
 #endif /* DJL_INTERNAL_H */
