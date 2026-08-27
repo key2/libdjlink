@@ -11,6 +11,10 @@
 #include "djlink.h"
 #include <string.h>
 
+/* Internal, shared with dbserver.c (PSSI fingerprint). Declared here to keep
+ * this file free of the pthread-pulling internal header. */
+void djl_sha1(const uint8_t *data, size_t len, uint8_t out[20]);
+
 typedef struct { uint32_t h[5]; uint64_t len; uint8_t buf[64]; size_t n; } sha1_ctx;
 
 static uint32_t rol(uint32_t v, int c) { return (v << c) | (v >> (32 - c)); }
@@ -76,6 +80,12 @@ static void put_be32(sha1_ctx *s, uint32_t v)
 {
     uint8_t b[4] = { (uint8_t)(v>>24), (uint8_t)(v>>16), (uint8_t)(v>>8), (uint8_t)v };
     sha1_update(s, b, 4);
+}
+
+/* One-shot SHA-1, exposed internally (e.g. PSSI fingerprinting). */
+void djl_sha1(const uint8_t *data, size_t len, uint8_t out[20])
+{
+    sha1_ctx s; sha1_init(&s); sha1_update(&s, data, len); sha1_final(&s, out);
 }
 
 djl_err djl_track_signature(const char *title, const char *artist,

@@ -530,6 +530,81 @@ static void test_signature(void)
     CHECK(memcmp(sig, sig2, 20) != 0, "signature must change with duration");
 }
 
+static void test_song_structure(void)
+{
+    /* Build an unmasked song_structure_body: mood(2)=1(high), pad6, end_beat(2)=256,
+     * pad2, bank(1)=3, pad1, then two 24-byte phrase entries. */
+    uint8_t sb[14 + 48];
+    memset(sb, 0, sizeof sb);
+    sb[0]=0x00; sb[1]=0x01;                 /* mood = high */
+    sb[8]=0x01; sb[9]=0x00;                 /* end_beat = 256 */
+    sb[12]=0x03;                            /* bank = 3 */
+    /* entry 0: index 1, beat 1, kind 1 (Intro) */
+    uint8_t *e0 = sb + 14;
+    e0[0]=0; e0[1]=1; e0[2]=0; e0[3]=1; e0[4]=0; e0[5]=1;
+    /* entry 1: index 2, beat 33, kind 5 (Chorus in high mood) */
+    uint8_t *e1 = sb + 14 + 24;
+    e1[0]=0; e1[1]=2; e1[2]=0; e1[3]=33; e1[4]=0; e1[5]=5;
+
+    static const uint8_t MASK[19] = {
+        0xCB,0xE1,0xEE,0xFA,0xE5,0xEE,0xAD,0xEE,0xE9,0xD2,
+        0xE9,0xEB,0xE1,0xE9,0xF3,0xE8,0xE9,0xF4,0xE1 };
+    const uint16_t cnt = 2;
+
+    /* Masked variant: tag body = esz(4)=24, cnt(2)=2, then XOR-masked body. */
+    uint8_t body[6 + sizeof sb];
+    body[0]=0; body[1]=0; body[2]=0; body[3]=24;
+    body[4]=0; body[5]=(uint8_t)cnt;
+    for (size_t i = 0; i < sizeof sb; i++)
+        body[6+i] = (uint8_t)(sb[i] ^ ((MASK[i % 19] + cnt) & 0xff));
+
+    /* raw_mood (first u2 of masked region) must look masked (>20). */
+    CHECK(((body[6]<<8)|body[7]) > 20, "synthetic PSSI should read as masked");
+
+    djl_song_structure ss;
+    CHECK_EQ_U(djl_parse_song_structure(body, sizeof body, &ss), DJL_OK);
+    CHECK_EQ_U(ss.mood, DJL_MOOD_HIGH);
+    CHECK_EQ_U(ss.bank, 3);
+    CHECK_EQ_U(ss.end_beat, 256);
+    CHECK_EQ_U(ss.count, 2);
+    if (ss.count == 2) {
+        CHECK_EQ_U(ss.phrases[0].index, 1);
+        CHECK_EQ_U(ss.phrases[0].beat, 1);
+        CHECK_EQ_U(ss.phrases[0].kind, 1);
+        CHECK_STR(ss.phrases[0].label, "Intro");
+        CHECK_EQ_U(ss.phrases[1].beat, 33);
+        CHECK_STR(ss.phrases[1].label, "Chorus");
+    }
+    djl_song_structure_free(&ss);
+
+    /* Unmasked variant: raw_mood <= 20, so no deobfuscation should occur. */
+    uint8_t body2[6 + sizeof sb];
+    body2[0]=0; body2[1]=0; body2[2]=0; body2[3]=24;
+    body2[4]=0; body2[5]=(uint8_t)cnt;
+    memcpy(body2 + 6, sb, sizeof sb);
+    djl_song_structure ss2;
+    CHECK_EQ_U(djl_parse_song_structure(body2, sizeof body2, &ss2), DJL_OK);
+    CHECK_EQ_U(ss2.mood, DJL_MOOD_HIGH);
+    CHECK_EQ_U(ss2.count, 2);
+    if (ss2.count == 2) CHECK_STR(ss2.phrases[1].label, "Chorus");
+    djl_song_structure_free(&ss2);
+
+    /* Label mapping sanity. */
+    CHECK_STR(djl_phrase_label(DJL_MOOD_MID, 8), "Bridge");
+    CHECK_STR(djl_phrase_label(DJL_MOOD_LOW, 10), "Outro");
+    CHECK_STR(djl_phrase_label(DJL_MOOD_HIGH, 2), "Up");
+}
+
+/* Verify the rekordbox hot-cue color LUT matches known reference values. */
+static void test_cue_color_lut(void)
+{
+    uint8_t r,g,b;
+    CHECK(djl_rekordbox_color(0x01,&r,&g,&b) && r==0x30 && g==0x5a && b==0xff, "color 0x01");
+    CHECK(djl_rekordbox_color(0x3e,&r,&g,&b) && r==0x64 && g==0x73 && b==0xff, "color 0x3e");
+    CHECK(!djl_rekordbox_color(0x00,&r,&g,&b), "color 0 = none");
+    CHECK(!djl_rekordbox_color(0x3f,&r,&g,&b), "color 0x3f out of range");
+}
+
 static void test_fuzz_no_crash(void)
 {
     /* Feed random bytes at every length to every decoder. The contract is
@@ -561,6 +636,9 @@ static void test_fuzz_no_crash(void)
         (void)djl_decode_media_details(buf, len, &md);
         (void)djl_wire_device_name(DJL_PORT_ANNOUNCE, buf, len, name, sizeof name);
         (void)djl_wire_device_name(DJL_PORT_STATUS, buf, len, name, sizeof name);
+
+        djl_song_structure ss;
+        if (djl_parse_song_structure(buf, len, &ss) == DJL_OK) djl_song_structure_free(&ss);
     }
     checks++;
     printf("  fuzz: 20000 iterations completed without crashing\n");
@@ -586,6 +664,8 @@ int main(void)
     test_media_details();
     test_real_cdj3000x_status();
     test_signature();
+    test_song_structure();
+    test_cue_color_lut();
     test_fuzz_no_crash();
 
     printf("\n%d checks, %d failure(s)\n", checks, failures);

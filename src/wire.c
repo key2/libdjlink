@@ -554,6 +554,7 @@ const char *djl_event_kind_name(djl_event_kind k)
     case DJL_EV_CUE_LIST:            return "CueList";
     case DJL_EV_ALBUM_ART:           return "AlbumArt";
     case DJL_EV_SIGNATURE:           return "Signature";
+    case DJL_EV_SONG_STRUCTURE:      return "SongStructure";
     case DJL_EV_UNKNOWN_PACKET:      return "UnknownPacket";
     default:                         return "?";
     }

@@ -1256,10 +1256,11 @@ live CDJ-3000X / DJM-A9 rig; **[built]** implemented, not yet hardware-verified;
 | `dbserver`: greeting, setup, metadata, folder browse, render/paging | **[done]** verified on CDJ-3000X | complete |
 | `dbserver`: search, remaining menu types, cue/beat-grid messages | **[built]**/**[todo]** transport done | complete |
 | Waveforms: blue preview + detail | **[done]** verified (CDJ-3000X self-analyzes unanalyzed media) | complete |
-| Waveforms: RGB, 3-band (ANLZ tags) | **[built]** rekordbox-track only; needs a rekordbox USB to verify | complete |
-| Cues: nexus and extended, colors, comments, hot cues A–H | **[done]** built (empty on non-rekordbox media) | complete |
+| Waveforms: RGB, 3-band (ANLZ tags) | **[built]** framing fixed (was off-by-16); needs rekordbox USB to verify | complete |
+| Cues: nexus and extended, colors (rekordbox LUT), comments, hot cues A–H | **[done]** built | complete |
 | Beat grids (dbserver) | **[done]** verified on CDJ-3000X | complete |
-| Song structure (`PSSI`), vocal config (`PWVC`) | **[todo]** step 9 (ANLZ) | complete |
+| Song structure (`PSSI`) phrases + deobfuscation | **[done]** dbserver fetch+parse, unit-tested | complete |
+| Vocal config (`PWVC`) | **[todo]** | complete |
 | NFS + `export.pdb` + ANLZ | **[todo]** step 9 | complete |
 | Device Library Plus (`exportLibrary.db`) | parse if a key is supplied | **encrypted; key not public** |
 | Opus Quad / XDJ-AZ via rekordbox-Lighting + PSSI matching | **[todo]** step 10 | mostly complete |

@@ -186,6 +186,7 @@ struct djl_context {
 
 void djl_log(djl_context *ctx, djl_log_level lvl, const char *fmt, ...);
 void djl_emit(djl_context *ctx, const djl_event *ev);
+void djl_sha1(const uint8_t *data, size_t len, uint8_t out[20]);
 
 /* Per-player fetched-metadata cache entry. */
 struct djl_meta_entry {
@@ -197,6 +198,7 @@ struct djl_meta_entry {
     bool has_cues; djl_cue_list cues;
     bool has_art;  djl_blob art;
     bool has_sig;  uint8_t sig[20];
+    bool has_ss;   djl_song_structure ss;
 };
 
 /* Metadata manager (metadata.c). enqueue must be called with ctx->lock held. */

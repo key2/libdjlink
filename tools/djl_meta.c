@@ -168,12 +168,16 @@ int main(int argc, char **argv)
             printf("  Artist:   %s\n", ti.artist);
             printf("  Album:    %s\n", ti.album);
             printf("  Genre:    %s\n", ti.genre);
+            printf("  Label:    %s\n", ti.label);
             printf("  Key:      %s\n", ti.key);
             printf("  Comment:  %s\n", ti.comment);
+            if (ti.original_artist[0]) printf("  Orig.Art: %s\n", ti.original_artist);
+            if (ti.remixer[0])         printf("  Remixer:  %s\n", ti.remixer);
             printf("  Duration: %u s   Tempo: %.2f BPM   Rating: %u\n",
                    ti.duration_s, ti.tempo_x100/100.0, ti.rating);
-            printf("  Added:    %s   Color: %s   Artwork id: %u\n",
-                   ti.date_added, ti.color_name, ti.artwork_id);
+            printf("  Year: %u   Bitrate: %u kbps   Added: %s\n",
+                   ti.year, ti.bitrate, ti.date_added);
+            printf("  Color: %s   Artwork id: %u\n", ti.color_name, ti.artwork_id);
         } else {
             printf("  no rekordbox metadata (%s) - trying track list for a filename\n",
                    djl_strerror(e));
@@ -185,6 +189,37 @@ int main(int argc, char **argv)
                             want_rgb?DJL_WAVE_RGB:DJL_WAVE_BLUE, false, &wf);
         if (e == DJL_OK) { render_waveform(&wf, cols); djl_waveform_free(&wf); }
         else printf("  waveform preview: %s\n", djl_strerror(e));
+
+        printf("\n=== cues (id %ld) ===\n", track_id);
+        djl_cue_list cl;
+        e = djl_db_cue_list(db, slot, type, (uint32_t)track_id, true, &cl);
+        if (e != DJL_OK) e = djl_db_cue_list(db, slot, type, (uint32_t)track_id, false, &cl);
+        if (e == DJL_OK) {
+            for (uint32_t i = 0; i < cl.count; i++) {
+                djl_cue_entry *c = &cl.entries[i];
+                printf("  %-6s %-8s %8u ms", c->is_loop ? "loop" : "cue",
+                       c->hot_cue ? (char[]){'A'+c->hot_cue-1,0} : "memory", c->start_ms);
+                if (c->is_loop) printf(" -> %u ms", c->end_ms);
+                if (c->has_color) printf("  color #%02x%02x%02x", c->r, c->g, c->b);
+                if (c->comment[0]) printf("  \"%s\"", c->comment);
+                printf("\n");
+            }
+            if (!cl.count) printf("  (none)\n");
+            djl_cue_list_free(&cl);
+        } else printf("  cues: %s\n", djl_strerror(e));
+
+        printf("\n=== phrases / song structure (id %ld) ===\n", track_id);
+        djl_song_structure ss;
+        e = djl_db_song_structure(db, slot, type, (uint32_t)track_id, &ss);
+        if (e == DJL_OK) {
+            static const char *moods[] = {"unknown","high","mid","low"};
+            printf("  mood=%s bank=%u end_beat=%u phrases=%u\n",
+                   moods[ss.mood <= 3 ? ss.mood : 0], ss.bank, ss.end_beat, ss.count);
+            for (uint32_t i = 0; i < ss.count; i++)
+                printf("    #%-2u beat %-5u  %s\n", ss.phrases[i].index,
+                       ss.phrases[i].beat, ss.phrases[i].label);
+            djl_song_structure_free(&ss);
+        } else printf("  song structure: %s\n", djl_strerror(e));
     }
 
     djl_db_close(db);

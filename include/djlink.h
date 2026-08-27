@@ -466,6 +466,7 @@ typedef enum {
     DJL_EV_CUE_LIST,
     DJL_EV_ALBUM_ART,
     DJL_EV_SIGNATURE,
+    DJL_EV_SONG_STRUCTURE,
     DJL_EV_UNKNOWN_PACKET,
     DJL_EV__COUNT
 } djl_event_kind;
@@ -508,6 +509,7 @@ typedef struct {
         struct { uint8_t player; uint32_t entries; bool extended; } cue_list;
         struct { uint8_t player; uint32_t artwork_id; uint32_t length; } album_art;
         struct { uint8_t player; uint8_t sha1[20]; } signature;
+        struct { uint8_t player; int mood; uint8_t bank; uint32_t phrases; } song_structure;
         struct {
             uint16_t port;
             uint8_t  kind_byte;
@@ -572,12 +574,20 @@ typedef struct {
     char     key[64];
     char     date_added[32];
     char     color_name[64];
-    uint32_t artist_id, album_id, genre_id, artwork_id;
+    char     label[128];
+    char     original_artist[256];
+    char     remixer[256];
+    uint32_t artist_id, album_id, genre_id, artwork_id, label_id;
     uint32_t duration_s;
     uint32_t tempo_x100;
+    uint32_t year;
+    uint32_t bitrate;
     uint8_t  rating;
     uint8_t  color_id;
 } djl_track_info;
+
+/* rekordbox hot-cue color code (1..0x3e) to RGB. Returns false for unknown/0. */
+DJL_API bool djl_rekordbox_color(uint8_t code, uint8_t *r, uint8_t *g, uint8_t *b);
 
 typedef struct {
     djl_waveform_style style;
@@ -665,6 +675,41 @@ DJL_API djl_err djl_db_album_art(djl_db *db, djl_slot slot, djl_track_type type,
                                  uint32_t artwork_id, djl_blob *out);
 DJL_API void    djl_blob_free(djl_blob *b);
 
+/* Song structure / phrase analysis (PSSI). rekordbox 6+ phrase-analyzed tracks. */
+typedef enum {
+    DJL_MOOD_UNKNOWN = 0, DJL_MOOD_HIGH = 1, DJL_MOOD_MID = 2, DJL_MOOD_LOW = 3
+} djl_track_mood;
+
+typedef struct {
+    uint16_t index;        /* phrase number, from 1 */
+    uint16_t beat;         /* beat at which the phrase starts */
+    uint16_t kind;         /* raw phrase kind id (interpretation depends on mood) */
+    char     label[24];    /* human phrase name (Intro/Verse/Chorus/Up/Down/Bridge/Outro) */
+} djl_phrase;
+
+typedef struct {
+    djl_track_mood mood;
+    uint8_t   bank;        /* rekordbox Lighting stylistic bank (0..8) */
+    uint16_t  end_beat;    /* beat at which the last phrase ends */
+    uint32_t  count;
+    djl_phrase *phrases;   /* library-owned */
+    uint8_t   sha1[20];    /* SHA-1 of the raw tag body (for Opus/PSSI matching) */
+    uint32_t  raw_len;     /* length of the deobfuscated body below */
+    uint8_t  *raw;         /* deobfuscated song-structure body, library-owned */
+} djl_song_structure;
+
+DJL_API djl_err djl_db_song_structure(djl_db *db, djl_slot slot, djl_track_type type,
+                                      uint32_t rekordbox_id, djl_song_structure *out);
+DJL_API void    djl_song_structure_free(djl_song_structure *s);
+DJL_API const char *djl_phrase_label(djl_track_mood mood, uint16_t kind);
+
+/* Parse a raw PSSI tag body (len_entry_bytes, len_entries, then the possibly
+ * XOR-masked song-structure body) into phrases. Deobfuscates when needed and
+ * fills sha1 with the SHA-1 of the raw body (for matching). Pure; usable on a
+ * PSSI blob obtained from any source (dbserver, NFS/ANLZ, or an Opus reply). */
+DJL_API djl_err djl_parse_song_structure(const uint8_t *tag_body, size_t len,
+                                         djl_song_structure *out);
+
 /* Browse the raw filesystem (folder_id 0xffffffff = root) or the whole track
  * list of a slot. Fills up to max rows, sets *count. */
 DJL_API djl_err djl_db_folder_menu(djl_db *db, djl_slot slot, djl_track_type type,
@@ -690,6 +735,7 @@ DJL_API djl_err djl_get_beat_grid(djl_context *ctx, uint8_t player, djl_beat_gri
 DJL_API djl_err djl_get_cue_list (djl_context *ctx, uint8_t player, djl_cue_list *out);
 DJL_API djl_err djl_get_album_art(djl_context *ctx, uint8_t player, djl_blob *out);
 DJL_API djl_err djl_get_signature(djl_context *ctx, uint8_t player, uint8_t out_sha1[20]);
+DJL_API djl_err djl_get_song_structure(djl_context *ctx, uint8_t player, djl_song_structure *out);
 
 /* SHA-1 track signature over title, artist, duration, the RGB waveform detail,
  * and the beat grid (same inputs as beat-link's SignatureFinder, used for

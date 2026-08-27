@@ -25,7 +25,10 @@ Verified against live hardware: 2 × `CDJ-3000X` (firmware 1.31) + `DJM-A9`.
 | Our own keep-alive + CDJ status emission @200 ms | done, verified |
 | Sync control, appoint master, load track | built, not hardware-verified |
 | **dbserver: folder browse, metadata, waveform** | **done, verified** |
-| **dbserver: beat grid, cue list, album art** | **done** (grid verified: counts match status) |
+| **dbserver: beat grid, cue list, album art** | **done** (grid verified) |
+| **Cue colors (rekordbox LUT), full metadata (label/year/bitrate/orig-artist/remixer)** | **done** (bitrate verified live) |
+| **Song structure / phrases (PSSI) + deobfuscation** | **done** (unit-tested; live needs rekordbox USB) |
+| **RGB / 3-band waveform framing fix** | **done** (needs rekordbox USB to verify) |
 | **Playback position interpolation** (`djl_get_position`, events) | **done, verified** |
 | **Track signature** (SHA-1) | **done** (KAT-tested) |
 | **Auto-fetch metadata on load** (worker + cache + events) | **done, verified** |

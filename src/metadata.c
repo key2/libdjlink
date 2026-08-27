@@ -22,6 +22,7 @@ static void entry_clear(struct djl_meta_entry *e)
     djl_beat_grid_free(&e->grid);
     djl_cue_list_free(&e->cues);
     djl_blob_free(&e->art);
+    djl_song_structure_free(&e->ss);
     memset(e, 0, sizeof *e);
 }
 
@@ -60,6 +61,10 @@ static void perform_fetch(djl_context *ctx, uint8_t player, uint8_t host,
     if (has_meta && meta.artwork_id)
         has_art = djl_db_album_art(db, slot, type, meta.artwork_id, &art) == DJL_OK;
 
+    djl_song_structure ss; bool has_ss = false;
+    if (type == DJL_TRACK_REKORDBOX)
+        has_ss = djl_db_song_structure(db, slot, type, id, &ss) == DJL_OK;
+
     /* Signature needs RGB detail + grid + names; only rekordbox tracks have the
      * .EXT detail, so only attempt it there. */
     uint8_t sig[20]; bool has_sig = false;
@@ -88,11 +93,13 @@ static void perform_fetch(djl_context *ctx, uint8_t player, uint8_t host,
         if (has_cues) { e->has_cues = true; e->cues = cues; }
         if (has_art)  { e->has_art  = true; e->art  = art; }
         if (has_sig)  { e->has_sig  = true; memcpy(e->sig, sig, 20); }
+        if (has_ss)   { e->has_ss   = true; e->ss   = ss; }
 
         djl_log(ctx, DJL_LOG_INFO,
-                "metadata p%u id=%u: %s%s%s%s%s", player, id,
+                "metadata p%u id=%u: %s%s%s%s%s%s", player, id,
                 has_meta ? "meta " : "", has_wave ? "wave " : "",
-                has_grid ? "grid " : "", has_cues ? "cues " : "", has_art ? "art " : "");
+                has_grid ? "grid " : "", has_cues ? "cues " : "", has_art ? "art " : "",
+                has_ss ? "phrases " : "");
 
         djl_event ev; memset(&ev, 0, sizeof ev);
         ev.device = player; ev.time_ms = djl_now_ms() - ctx->t0;
@@ -115,12 +122,17 @@ static void perform_fetch(djl_context *ctx, uint8_t player, uint8_t host,
         if (has_sig)  { memset(&ev,0,sizeof ev); ev.device=player; ev.time_ms=djl_now_ms()-ctx->t0;
                         ev.kind = DJL_EV_SIGNATURE; ev.u.signature.player=player;
                         memcpy(ev.u.signature.sha1, sig, 20); djl_emit(ctx,&ev); }
+        if (has_ss)   { memset(&ev,0,sizeof ev); ev.device=player; ev.time_ms=djl_now_ms()-ctx->t0;
+                        ev.kind = DJL_EV_SONG_STRUCTURE; ev.u.song_structure.player=player;
+                        ev.u.song_structure.mood=(int)ss.mood; ev.u.song_structure.bank=ss.bank;
+                        ev.u.song_structure.phrases=ss.count; djl_emit(ctx,&ev); }
     } else {
         /* nobody to store it for; drop the freshly-fetched data */
         if (has_wave) djl_waveform_free(&wave);
         if (has_grid) djl_beat_grid_free(&grid);
         if (has_cues) djl_cue_list_free(&cues);
         if (has_art)  djl_blob_free(&art);
+        if (has_ss)   djl_song_structure_free(&ss);
     }
     pthread_mutex_unlock(&ctx->lock);
     (void)emit_note;
@@ -315,6 +327,32 @@ djl_err djl_get_signature(djl_context *ctx, uint8_t player, uint8_t out_sha1[20]
     pthread_mutex_lock(&ctx->lock);
     if (ctx->meta_cache && ctx->meta_cache[player].has_sig) {
         memcpy(out_sha1, ctx->meta_cache[player].sig, 20); r = DJL_OK;
+    }
+    pthread_mutex_unlock(&ctx->lock);
+    return r;
+}
+
+djl_err djl_get_song_structure(djl_context *ctx, uint8_t player, djl_song_structure *out)
+{
+    if (!ctx || !out || player >= 64) return DJL_ERR_INVAL;
+    memset(out, 0, sizeof *out);
+    djl_err r = DJL_ERR_NOT_FOUND;
+    pthread_mutex_lock(&ctx->lock);
+    if (ctx->meta_cache && ctx->meta_cache[player].has_ss) {
+        djl_song_structure *s = &ctx->meta_cache[player].ss;
+        out->mood = s->mood; out->bank = s->bank; out->end_beat = s->end_beat;
+        memcpy(out->sha1, s->sha1, 20);
+        r = DJL_OK;
+        if (s->count) {
+            out->phrases = malloc(s->count * sizeof *s->phrases);
+            if (out->phrases) { memcpy(out->phrases, s->phrases, s->count * sizeof *s->phrases);
+                                out->count = s->count; }
+            else r = DJL_ERR_NOMEM;
+        }
+        if (r == DJL_OK && s->raw && s->raw_len) {
+            out->raw = malloc(s->raw_len);
+            if (out->raw) { memcpy(out->raw, s->raw, s->raw_len); out->raw_len = s->raw_len; }
+        }
     }
     pthread_mutex_unlock(&ctx->lock);
     return r;

@@ -486,14 +486,23 @@ static void meta_item_cb(const db_message *m, void *ud)
     case 0x0007: /* artist */
         copy_str(t->artist, sizeof t->artist, &m->args[3]);
         t->artist_id = (uint32_t)m->args[1].num; break;
+    case 0x0028: /* original artist */
+        copy_str(t->original_artist, sizeof t->original_artist, &m->args[3]); break;
+    case 0x0029: /* remixer */
+        copy_str(t->remixer, sizeof t->remixer, &m->args[3]); break;
     case 0x0002: /* album */
         copy_str(t->album, sizeof t->album, &m->args[3]);
         t->album_id = (uint32_t)m->args[1].num; break;
     case 0x0006: /* genre */
         copy_str(t->genre, sizeof t->genre, &m->args[3]);
         t->genre_id = (uint32_t)m->args[1].num; break;
+    case 0x000e: /* label */
+        copy_str(t->label, sizeof t->label, &m->args[3]);
+        t->label_id = (uint32_t)m->args[1].num; break;
     case 0x000b: t->duration_s = (uint32_t)m->args[1].num; break;   /* duration */
     case 0x000d: t->tempo_x100 = (uint32_t)m->args[1].num; break;   /* tempo */
+    case 0x0010: t->bitrate    = (uint32_t)m->args[1].num; break;   /* bit rate */
+    case 0x0011: t->year       = (uint32_t)m->args[1].num; break;   /* year */
     case 0x0023: copy_str(t->comment, sizeof t->comment, &m->args[3]); break;
     case 0x000f: copy_str(t->key, sizeof t->key, &m->args[3]); break;
     case 0x000a: t->rating = (uint8_t)m->args[1].num; break;        /* rating */
@@ -623,14 +632,63 @@ static djl_err fetch_blob(struct djl_db *d, uint16_t req_type, const db_arg *arg
     return DJL_OK;
 }
 
-static djl_err anlz_tag(struct djl_db *d, djl_slot slot, djl_track_type type, uint32_t id,
-                        uint32_t tag, uint32_t ext, uint8_t **data, uint32_t *len)
+static uint32_t be32(const uint8_t *p)
 {
+    return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3];
+}
+
+/* Fetch an ANLZ tag (0x2c04) and return the *tag body*, i.e. the bytes after
+ * the dbserver 4-byte length prefix and the 12-byte TaggedSection header
+ * (fourcc, len_header, len_tag). This matches beat-link's getTagViaDbServer,
+ * which does position(4) then parses a TaggedSection whose body starts at +12.
+ * Caller frees *body. */
+static djl_err anlz_body(struct djl_db *d, djl_slot slot, djl_track_type type, uint32_t id,
+                         uint32_t tag, uint32_t ext, uint8_t **body, uint32_t *body_len)
+{
+    uint8_t *raw = NULL; uint32_t rlen = 0;
     db_arg a[4] = {
         { A_NUM, rmst(d, MENU_MAIN, slot, type), 0,0,0 },
         { A_NUM, id, 0,0,0 }, { A_NUM, tag, 0,0,0 }, { A_NUM, ext, 0,0,0 },
     };
-    return fetch_blob(d, 0x2c04, a, 4, 0x4f02, data, len);
+    djl_err e = fetch_blob(d, 0x2c04, a, 4, 0x4f02, &raw, &rlen);
+    if (e != DJL_OK) return e;
+    if (rlen < 16) { free(raw); return DJL_ERR_UNAVAILABLE; }
+    /* raw = [len(4)][fourcc(4)][len_header(4)][len_tag(4)][body...] */
+    uint32_t len_tag = be32(raw + 12);
+    uint32_t blen = (len_tag >= 12) ? (len_tag - 12) : 0;
+    if (blen == 0 || blen > rlen - 16) blen = rlen - 16;   /* clamp to available */
+    uint8_t *b = malloc(blen ? blen : 1);
+    if (!b) { free(raw); return DJL_ERR_NOMEM; }
+    memcpy(b, raw + 16, blen);
+    free(raw);
+    *body = b; *body_len = blen;
+    return DJL_OK;
+}
+
+/* Strip the waveform sub-header (len_entry_bytes u4, len_entries u4, and an
+ * optional unknown u4 present on PWV4/5/7 but not PWV6) by auto-detecting its
+ * size from len_entry_bytes*len_entries, leaving pure entry bytes in *out. */
+static djl_err normalize_wave(uint8_t *body, uint32_t body_len, djl_waveform_blob *out,
+                              djl_waveform_style style, bool detail)
+{
+    if (body_len < 8) { free(body); return DJL_ERR_UNAVAILABLE; }
+    uint32_t esz = be32(body);
+    uint32_t cnt = be32(body + 4);
+    uint64_t entries_bytes = (uint64_t)esz * cnt;
+    uint32_t hdr;
+    if (esz && cnt && (uint64_t)body_len >= 8 + entries_bytes && body_len - 8 == entries_bytes)
+        hdr = 8;                                  /* PWV6: no unknown field */
+    else if (esz && cnt && (uint64_t)body_len >= 12 + entries_bytes)
+        hdr = 12;                                 /* PWV4/PWV5/PWV7 */
+    else { free(body); return DJL_ERR_UNAVAILABLE; }
+
+    uint32_t elen = (uint32_t)entries_bytes;
+    uint8_t *ent = malloc(elen ? elen : 1);
+    if (!ent) { free(body); return DJL_ERR_NOMEM; }
+    memcpy(ent, body + hdr, elen);
+    free(body);
+    out->style = style; out->detail = detail; out->data = ent; out->length = elen;
+    return DJL_OK;
 }
 
 djl_err djl_db_waveform(djl_db *d, djl_slot slot, djl_track_type type, uint32_t id,
@@ -638,24 +696,21 @@ djl_err djl_db_waveform(djl_db *d, djl_slot slot, djl_track_type type, uint32_t 
 {
     if (!d || !out) return DJL_ERR_INVAL;
     memset(out, 0, sizeof *out);
-    uint8_t *data = NULL; uint32_t len = 0;
+    uint8_t *data = NULL, *body = NULL; uint32_t len = 0, blen = 0;
     djl_err e;
 
-    /* The RGB and 3-band waveforms live in the ANLZ .EXT/.2EX files that only
-     * exist for rekordbox-analyzed tracks. Requesting those tags for an
-     * unanalyzed or CD track leaves the player silent, which stalls the
-     * connection and can desync it with a late reply. So only attempt the
-     * color tags for rekordbox tracks; everything else goes straight to blue,
-     * which the CDJ-3000 generates on the fly even for unanalyzed media. */
+    /* RGB/3-band live in ANLZ .EXT/.2EX files that only exist for
+     * rekordbox-analyzed tracks; requesting them for unanalyzed media leaves
+     * the player silent and desyncs the connection, so gate on track type. */
     if (type == DJL_TRACK_REKORDBOX && want == DJL_WAVE_RGB) {
-        e = anlz_tag(d, slot, type, id, detail ? TAG_PWV5 : TAG_PWV4, EXT_EXT, &data, &len);
-        if (e == DJL_OK) { out->style = DJL_WAVE_RGB; out->detail = detail; out->length = len; out->data = data; return DJL_OK; }
+        e = anlz_body(d, slot, type, id, detail ? TAG_PWV5 : TAG_PWV4, EXT_EXT, &body, &blen);
+        if (e == DJL_OK) return normalize_wave(body, blen, out, DJL_WAVE_RGB, detail);
     } else if (type == DJL_TRACK_REKORDBOX && want == DJL_WAVE_THREE_BAND) {
-        e = anlz_tag(d, slot, type, id, detail ? TAG_PWV7 : TAG_PWV6, EXT_2EX, &data, &len);
-        if (e == DJL_OK) { out->style = DJL_WAVE_THREE_BAND; out->detail = detail; out->length = len; out->data = data; return DJL_OK; }
+        e = anlz_body(d, slot, type, id, detail ? TAG_PWV7 : TAG_PWV6, EXT_2EX, &body, &blen);
+        if (e == DJL_OK) return normalize_wave(body, blen, out, DJL_WAVE_THREE_BAND, detail);
     }
 
-    /* Blue fallback via dedicated messages. */
+    /* Blue via dedicated messages (already pure entry bytes, no tag header). */
     if (detail) {
         db_arg a[3] = { { A_NUM, rmst(d, MENU_MAIN, slot, type),0,0,0 },
                         { A_NUM, id,0,0,0 }, { A_NUM, 0,0,0,0 } };
@@ -752,6 +807,36 @@ static void utf16le_to_utf8(const uint8_t *src, size_t bytes, char *out, size_t 
     out[o] = 0;
 }
 
+/* rekordbox hot-cue color code (0x01..0x3e) to RGB, ported from beat-link's
+ * CueList.findRekordboxColor. */
+bool djl_rekordbox_color(uint8_t code, uint8_t *r, uint8_t *g, uint8_t *b)
+{
+    static const uint8_t tbl[0x3f][3] = {
+        {0,0,0},
+        {0x30,0x5a,0xff},{0x50,0x73,0xff},{0x50,0x8c,0xff},{0x50,0xa0,0xff},
+        {0x50,0xb4,0xff},{0x50,0xb0,0xf2},{0x50,0xae,0xe8},{0x45,0xac,0xdb},
+        {0x00,0xe0,0xff},{0x19,0xda,0xf0},{0x32,0xd2,0xe6},{0x21,0xb4,0xb9},
+        {0x20,0xaa,0xa0},{0x1f,0xa3,0x92},{0x19,0xa0,0x8c},{0x14,0xa5,0x84},
+        {0x14,0xaa,0x7d},{0x10,0xb1,0x76},{0x30,0xd2,0x6e},{0x37,0xde,0x5a},
+        {0x3c,0xeb,0x50},{0x28,0xe2,0x14},{0x7d,0xc1,0x3d},{0x8c,0xc8,0x32},
+        {0x9b,0xd7,0x23},{0xa5,0xe1,0x16},{0xa5,0xdc,0x0a},{0xaa,0xd2,0x08},
+        {0xb4,0xc8,0x05},{0xb4,0xbe,0x04},{0xba,0xb4,0x04},{0xc3,0xaf,0x04},
+        {0xe1,0xaa,0x00},{0xff,0xa0,0x00},{0xff,0x96,0x00},{0xff,0x8c,0x00},
+        {0xff,0x75,0x00},{0xe0,0x64,0x1b},{0xe0,0x46,0x1e},{0xe0,0x30,0x1e},
+        {0xe0,0x28,0x23},{0xe6,0x28,0x28},{0xff,0x37,0x6f},{0xff,0x2d,0x6f},
+        {0xff,0x12,0x7b},{0xf5,0x1e,0x8c},{0xeb,0x2d,0xa0},{0xe6,0x37,0xb4},
+        {0xde,0x44,0xcf},{0xde,0x44,0x8d},{0xe6,0x30,0xb4},{0xe6,0x19,0xdc},
+        {0xe6,0x00,0xff},{0xdc,0x00,0xff},{0xcc,0x00,0xff},{0xb4,0x32,0xff},
+        {0xb9,0x3c,0xff},{0xc5,0x42,0xff},{0xaa,0x5a,0xff},{0xaa,0x72,0xff},
+        {0x82,0x72,0xff},{0x64,0x73,0xff},
+    };
+    if (code == 0 || code > 0x3e) return false;
+    if (r) *r = tbl[code][0];
+    if (g) *g = tbl[code][1];
+    if (b) *b = tbl[code][2];
+    return true;
+}
+
 static djl_err parse_nexus_cues(const uint8_t *b, uint32_t len, djl_cue_list *out)
 {
     uint32_t n = len / 36;
@@ -797,6 +882,9 @@ static djl_err parse_nxs2_cues(const uint8_t *b, uint32_t len, uint32_t declared
                 if (cbase + 3 < len) {
                     e->color_id = b[cbase];
                     e->r = b[cbase+1]; e->g = b[cbase+2]; e->b = b[cbase+3];
+                    /* If no embedded RGB, fall back to the rekordbox color LUT. */
+                    if (!(e->r || e->g || e->b) && e->color_id)
+                        djl_rekordbox_color(e->color_id, &e->r, &e->g, &e->b);
                     e->has_color = (e->r || e->g || e->b || e->color_id);
                 }
             }
@@ -842,56 +930,46 @@ void djl_cue_list_free(djl_cue_list *c)
     if (c) { free(c->entries); c->entries = NULL; c->count = 0; }
 }
 
-/* -------------------- waveform accessors -------------------- */
-
-/* For RGB/3-band the blob starts with two u32 (entry size, entry count). */
-static uint32_t rgb_header(const djl_waveform_blob *wf, uint32_t *entry_size)
+/* -------------------- waveform accessors --------------------
+ * After normalize_wave/blue fetch, wf->data holds pure entry bytes with a
+ * per-style entry size:
+ *   BLUE  preview 2B (height 0-31, whiteness), detail 1B (bits 7-5 color, 4-0 height)
+ *   RGB   preview 6B, detail 2B (16-bit big-endian: rrr ggg bbb hhhhh 0)
+ *   3BAND preview/detail 3B: mid, high, low heights (colors amber/white/blue)
+ * RGB preview byte semantics are best-effort pending verification on rekordbox
+ * media; the raw entries remain available in wf->data. */
+static uint32_t wf_entry_size(const djl_waveform_blob *wf)
 {
-    if (wf->length < 8) { if (entry_size) *entry_size = 0; return 0; }
-    uint32_t esz = ((uint32_t)wf->data[0]<<24)|((uint32_t)wf->data[1]<<16)|((uint32_t)wf->data[2]<<8)|wf->data[3];
-    uint32_t cnt = ((uint32_t)wf->data[4]<<24)|((uint32_t)wf->data[5]<<16)|((uint32_t)wf->data[6]<<8)|wf->data[7];
-    if (entry_size) *entry_size = esz;
-    return cnt;
+    switch (wf->style) {
+    case DJL_WAVE_BLUE:       return wf->detail ? 1 : 2;
+    case DJL_WAVE_RGB:        return wf->detail ? 2 : 6;
+    case DJL_WAVE_THREE_BAND: return 3;
+    }
+    return 1;
 }
 
 int djl_waveform_segment_count(const djl_waveform_blob *wf)
 {
     if (!wf || !wf->data) return 0;
-    switch (wf->style) {
-    case DJL_WAVE_BLUE:
-        return wf->detail ? (int)wf->length : (int)(wf->length / 2);
-    case DJL_WAVE_RGB:
-    case DJL_WAVE_THREE_BAND: {
-        uint32_t esz; uint32_t cnt = rgb_header(wf, &esz);
-        if (cnt) return (int)cnt;
-        uint32_t per = (wf->style == DJL_WAVE_RGB) ? (wf->detail ? 2 : 6) : 3;
-        return (int)(wf->length / per);
-    }
-    }
-    return 0;
+    uint32_t es = wf_entry_size(wf);
+    return es ? (int)(wf->length / es) : 0;
 }
 
 int djl_waveform_height(const djl_waveform_blob *wf, int seg)
 {
     if (!wf || !wf->data || seg < 0) return 0;
+    uint32_t es = wf_entry_size(wf);
+    uint32_t base = (uint32_t)seg * es;
+    if (base + es > wf->length) return 0;
+    const uint8_t *p = wf->data + base;
     switch (wf->style) {
     case DJL_WAVE_BLUE:
-        if (wf->detail) { if ((uint32_t)seg < wf->length) return wf->data[seg] & 0x1f; }
-        else            { if ((uint32_t)(seg*2) < wf->length) return wf->data[seg*2] & 0x1f; }
-        return 0;
-    case DJL_WAVE_RGB: {
-        uint32_t esz; rgb_header(wf, &esz);
-        uint32_t base = 8 + (uint32_t)seg * (wf->detail ? 2 : 6);
-        if (wf->detail) { if (base+1 < wf->length) return (wf->data[base]<<8|wf->data[base+1])>>5 & 0x1f; }
-        else            { if (base+5 < wf->length) { int m=wf->data[base+3],h=wf->data[base+4],l=wf->data[base+5];
-                          int v=m>h?m:h; v=v>l?v:l; return v>31?31:v; } }
-        return 0;
-    }
+        return wf->detail ? (p[0] & 0x1f) : (p[0] & 0x1f);
+    case DJL_WAVE_RGB:
+        if (wf->detail) { uint16_t v = (uint16_t)((p[0]<<8)|p[1]); return (v >> 2) & 0x1f; }
+        else { int r=p[3],g=p[4],b=p[5]; int m=r>g?r:g; m=m>b?m:b; return m>31?31:m; }
     case DJL_WAVE_THREE_BAND: {
-        uint32_t base = 8 + (uint32_t)seg * 3;
-        if (base+2 < wf->length) { int a=wf->data[base],b=wf->data[base+1],c=wf->data[base+2];
-            int v=a>b?a:b; v=v>c?v:c; return v>31?31:v; }
-        return 0;
+        int mid=p[0],hi=p[1],lo=p[2]; int m=mid>hi?mid:hi; m=m>lo?m:lo; return m>31?31:m;
     }
     }
     return 0;
@@ -901,19 +979,128 @@ void djl_waveform_rgb(const djl_waveform_blob *wf, int seg, uint8_t *r, uint8_t 
 {
     uint8_t rr=0,gg=0,bb=0;
     if (wf && wf->data && seg >= 0) {
-        if (wf->style == DJL_WAVE_RGB && !wf->detail) {
-            uint32_t base = 8 + (uint32_t)seg*6;
-            if (base+5 < wf->length) { rr=wf->data[base+3]; gg=wf->data[base+4]; bb=wf->data[base+5];
-                rr=(uint8_t)(rr*8); gg=(uint8_t)(gg*8); bb=(uint8_t)(bb*8); }
-        } else if (wf->style == DJL_WAVE_THREE_BAND) {
-            uint32_t base = 8 + (uint32_t)seg*3;
-            if (base+2 < wf->length) { bb=(uint8_t)(wf->data[base]*8); rr=(uint8_t)(wf->data[base+1]*8); gg=(uint8_t)(wf->data[base+2]*4); }
-        } else {
-            int h = djl_waveform_height(wf, seg);
-            rr = gg = 0; bb = (uint8_t)(h * 8);   /* blue */
+        uint32_t es = wf_entry_size(wf);
+        uint32_t base = (uint32_t)seg * es;
+        if (base + es <= wf->length) {
+            const uint8_t *p = wf->data + base;
+            switch (wf->style) {
+            case DJL_WAVE_RGB:
+                if (wf->detail) { uint16_t v=(uint16_t)((p[0]<<8)|p[1]);
+                    rr=(uint8_t)(((v>>13)&7)*36); gg=(uint8_t)(((v>>10)&7)*36); bb=(uint8_t)(((v>>7)&7)*36); }
+                else { rr=(uint8_t)(p[3]*8); gg=(uint8_t)(p[4]*8); bb=(uint8_t)(p[5]*8); }
+                break;
+            case DJL_WAVE_THREE_BAND:   /* mid=amber, high=white, low=blue */
+                rr=(uint8_t)((p[0] + p[1]) > 31 ? 255 : (p[0]+p[1])*8);
+                gg=(uint8_t)(((p[0]*2/3) + p[1]) > 31 ? 200 : ((p[0]*2/3)+p[1])*8);
+                bb=(uint8_t)((p[2] + p[1]) > 31 ? 255 : (p[2]+p[1])*8);
+                break;
+            case DJL_WAVE_BLUE: {
+                int h = p[0] & 0x1f; bb = (uint8_t)(h * 8);
+                break;
+            }
+            }
         }
     }
     if (r) *r = rr;
     if (g) *g = gg;
     if (b) *b = bb;
+}
+
+/* -------------------- song structure (PSSI) -------------------- */
+
+static const char *PHRASE_HIGH[] = {"","Intro","Up","Down","","Chorus","Outro"};
+static const char *PHRASE_MID[]  = {"","Intro","Verse 1","Verse 2","Verse 3","Verse 4",
+                                    "Verse 5","Verse 6","Bridge","Chorus","Outro"};
+static const char *PHRASE_LOW[]  = {"","Intro","Verse 1","Verse 1","Verse 1","Verse 2",
+                                    "Verse 2","Verse 2","Bridge","Chorus","Outro"};
+
+const char *djl_phrase_label(djl_track_mood mood, uint16_t kind)
+{
+    switch (mood) {
+    case DJL_MOOD_HIGH: return (kind < 7)  ? PHRASE_HIGH[kind] : "";
+    case DJL_MOOD_MID:  return (kind < 11) ? PHRASE_MID[kind]  : "";
+    case DJL_MOOD_LOW:  return (kind < 11) ? PHRASE_LOW[kind]  : "";
+    default:            return "";
+    }
+}
+
+/* XOR deobfuscation mask base (crate-digger rekordbox_anlz.ksy song_structure).
+ * Each byte is (base[i%19] + len_entries) & 0xff. */
+static const uint8_t PSSI_MASK[19] = {
+    0xCB,0xE1,0xEE,0xFA,0xE5,0xEE,0xAD,0xEE,0xE9,0xD2,
+    0xE9,0xEB,0xE1,0xE9,0xF3,0xE8,0xE9,0xF4,0xE1
+};
+
+djl_err djl_parse_song_structure(const uint8_t *tag_body, size_t len, djl_song_structure *out)
+{
+    if (!out) return DJL_ERR_INVAL;
+    memset(out, 0, sizeof *out);
+    if (!tag_body || len < 8) return DJL_ERR_UNAVAILABLE;
+
+    /* tag_body = len_entry_bytes(u4), len_entries(u2), then the maybe-masked rest. */
+    uint16_t cnt = (uint16_t)((tag_body[4] << 8) | tag_body[5]);
+    djl_sha1(tag_body, len, out->sha1);      /* fingerprint over the raw body */
+
+    uint32_t mlen = (uint32_t)len - 6;
+    uint8_t *mreg = malloc(mlen ? mlen : 1);  /* work on a copy, keep input const */
+    if (!mreg) return DJL_ERR_NOMEM;
+    memcpy(mreg, tag_body + 6, mlen);
+
+    /* raw_mood is the first u2 of the masked region; >20 means it is masked. */
+    if (mlen >= 2) {
+        uint16_t raw_mood = (uint16_t)((mreg[0] << 8) | mreg[1]);
+        if (raw_mood > 20)
+            for (uint32_t i = 0; i < mlen; i++)
+                mreg[i] ^= (uint8_t)(PSSI_MASK[i % 19] + cnt);
+    }
+
+    /* song_structure_body: mood(u2)@0, +6, end_beat(u2)@8, +2, raw_bank(u1)@12,
+     * +1, entries@14, each 24 bytes: index(u2), beat(u2), kind(u2), ... */
+    if (mlen >= 14) {
+        out->mood     = (djl_track_mood)((mreg[0] << 8) | mreg[1]);
+        out->end_beat = (uint16_t)((mreg[8] << 8) | mreg[9]);
+        out->bank     = mreg[12];
+    }
+    if (out->mood < DJL_MOOD_HIGH || out->mood > DJL_MOOD_LOW) out->mood = DJL_MOOD_UNKNOWN;
+
+    out->raw_len = mlen;
+    out->raw = mreg;                          /* transfer the deobfuscated copy */
+
+    uint32_t avail = (mlen >= 14) ? (mlen - 14) / 24 : 0;
+    if (cnt > avail) cnt = (uint16_t)avail;
+    if (cnt) {
+        out->phrases = calloc(cnt, sizeof *out->phrases);
+        if (!out->phrases) return DJL_ERR_NOMEM;   /* out->raw freed by caller via free */
+        for (uint32_t i = 0; i < cnt; i++) {
+            const uint8_t *pe = mreg + 14 + i * 24;
+            djl_phrase *ph = &out->phrases[i];
+            ph->index = (uint16_t)((pe[0] << 8) | pe[1]);
+            ph->beat  = (uint16_t)((pe[2] << 8) | pe[3]);
+            ph->kind  = (uint16_t)((pe[4] << 8) | pe[5]);
+            snprintf(ph->label, sizeof ph->label, "%s", djl_phrase_label(out->mood, ph->kind));
+        }
+        out->count = cnt;
+    }
+    return DJL_OK;
+}
+
+djl_err djl_db_song_structure(djl_db *d, djl_slot slot, djl_track_type type,
+                              uint32_t id, djl_song_structure *out)
+{
+    if (!d || !out) return DJL_ERR_INVAL;
+    memset(out, 0, sizeof *out);
+    if (type != DJL_TRACK_REKORDBOX) return DJL_ERR_UNAVAILABLE;
+
+    uint8_t *body = NULL; uint32_t blen = 0;
+    /* PSSI = 0x50535349, in the EXT file. */
+    djl_err e = anlz_body(d, slot, type, id, 0x50535349u, EXT_EXT, &body, &blen);
+    if (e != DJL_OK) return e;
+    e = djl_parse_song_structure(body, blen, out);
+    free(body);
+    return e;
+}
+
+void djl_song_structure_free(djl_song_structure *s)
+{
+    if (s) { free(s->phrases); free(s->raw); s->phrases = NULL; s->raw = NULL; s->count = 0; }
 }
