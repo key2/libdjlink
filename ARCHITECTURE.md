@@ -391,6 +391,13 @@ When four real players occupy 1–4, or when we want the *complete* collection, 
 portmapper plus `mount` v1 and `nfs` v2 servers.
 
 - Mount export path: SD → `/B/`, USB → `/C/` (`data/CrateDigger.java:139`).
+- **All string arguments are UTF-16LE**: the `MOUNT` `DirPath` *and* every `NFS LOOKUP`
+  filename. This is the single most important quirk. **Verified 2026-08-27** on a
+  CDJ-3000X: `MNT "/C/"` as UTF-16LE returns a valid file handle, while the same path as
+  ASCII returns `EACCES` (status 13). Our earlier conclusion that the CDJ-3000X had
+  "locked down" NFS was **wrong** — it was our ASCII encoding. No privileged source port
+  is required (an ephemeral port works); `bindresvport` is unnecessary. Confirmed by
+  reading `PIONEER/rekordbox/export.pdb` (DeviceSQL, 212 KB) end-to-end over NFS.
 - Database: `PIONEER/rekordbox/export.pdb` (DeviceSQL) or
   `PIONEER/rekordbox/exportLibrary.db` (SQLite "Device Library Plus", **encrypted** —
   used by Opus Quad and XDJ-AZ).
@@ -398,6 +405,9 @@ portmapper plus `mount` v1 and `nfs` v2 servers.
   to `.EXT` and `.2EX`.
 - **Quirk:** HFS+-formatted media hides the directory as `.PIONEER`. On a lookup failure
   for `PIONEER`, retry with the dot-prefixed name and remember that per slot.
+- The NFS path is more reliable than `dbserver` for ANLZ tags: the `0x2c04` ANLZ-tag
+  query can be flaky/unavailable (e.g. `PSSI` came back unavailable in our dbserver
+  tests), whereas reading the `.EXT` file directly always yields the phrases.
 
 ### 1.9 Opus Quad / XDJ-AZ (rekordbox-Lighting persona)
 
@@ -1261,7 +1271,7 @@ live CDJ-3000X / DJM-A9 rig; **[built]** implemented, not yet hardware-verified;
 | Beat grids (dbserver) | **[done]** verified on CDJ-3000X | complete |
 | Song structure (`PSSI`) phrases + deobfuscation | **[done]** dbserver fetch+parse, unit-tested | complete |
 | Vocal config (`PWVC`) | **[todo]** | complete |
-| NFS + `export.pdb` + ANLZ | **[todo]** step 9 | complete |
+| NFS + `export.pdb` + ANLZ | **[todo]** step 9 — **UNBLOCKED**: UTF-16LE mount verified live (was our ASCII bug, not a firmware lockdown) | complete |
 | Device Library Plus (`exportLibrary.db`) | parse if a key is supplied | **encrypted; key not public** |
 | Opus Quad / XDJ-AZ via rekordbox-Lighting + PSSI matching | **[todo]** step 10 | mostly complete |
 | rekordbox EXPORT NFS *server* (CDJs mount us) + UTF-16LE names | **[todo]** whole subsystem, see §1.11 | observed 2026-08-27 |
