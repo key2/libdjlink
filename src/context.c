@@ -515,9 +515,11 @@ static void handle_status(djl_context *ctx, const uint8_t *buf, size_t len,
             tl.u.track_loaded.rekordbox_id  = st.rekordbox_id;
             djl_emit(ctx, &tl);
 
-            /* Kick off an automatic metadata fetch from the hosting player. */
+            /* Kick off an automatic metadata fetch from the hosting player.
+             * No device-number requirement here: the NFS provider works at any
+             * number (or none), and the dbserver provider checks the 1..6
+             * constraint itself. We only refuse to query ourselves. */
             if (ctx->cfg.auto_metadata && !ctx->cfg.observe_only &&
-                ctx->id.number >= 1 && ctx->id.number <= 6 &&
                 st.track_device != ctx->id.number)
                 djl_meta_enqueue(ctx, st.number, st.track_device,
                                  st.track_slot, st.track_type, st.rekordbox_id);
@@ -819,6 +821,14 @@ djl_err djl_context_create(const djl_config *cfg, djl_context **out)
     ctx->adv_bib   = 1;
     ctx->adv_beat  = 0;
     ctx->next_master = 0xff;
+
+    /* NFS first: it works at any device number, returns the complete ANLZ set
+     * (including PSSI, which the dbserver tag query serves unreliably), and
+     * does not compete for the four dbserver-capable slots. dbserver follows
+     * as the only source for audio CDs and streaming tracks. */
+    ctx->providers[0]   = DJL_PROVIDER_NFS;
+    ctx->providers[1]   = DJL_PROVIDER_DBSERVER;
+    ctx->provider_count = 2;
 
     pthread_mutex_init(&ctx->lock, NULL);
     pthread_cond_init(&ctx->ev_cond, NULL);

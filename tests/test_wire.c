@@ -10,8 +10,13 @@
 #include <string.h>
 #include <stdlib.h>
 
-static int failures = 0;
-static int checks = 0;
+int djl_test_failures = 0;
+int djl_test_checks = 0;
+#define failures djl_test_failures
+#define checks   djl_test_checks
+
+/* Implemented in test_nfs.c: NFS/RPC/XDR, PDB and ANLZ codecs. */
+void djl_test_nfs(void);
 
 #define CHECK(cond, ...) do {                            \
     checks++;                                            \
@@ -667,6 +672,7 @@ int main(void)
     test_song_structure();
     test_cue_color_lut();
     test_fuzz_no_crash();
+    djl_test_nfs();
 
     printf("\n%d checks, %d failure(s)\n", checks, failures);
     return failures ? 1 : 0;

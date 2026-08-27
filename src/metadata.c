@@ -41,45 +41,199 @@ static void emit_note(djl_context *ctx, djl_event_kind kind, uint8_t player,
     djl_emit(ctx, &ev);
 }
 
-static void perform_fetch(djl_context *ctx, uint8_t player, uint8_t host,
-                          djl_slot slot, djl_track_type type, uint32_t id)
+/* One fetch attempt's results, before they are published into the cache. */
+typedef struct {
+    bool has_meta; djl_track_info     meta;
+    bool has_wave; djl_waveform_blob  wave;
+    bool has_grid; djl_beat_grid      grid;
+    bool has_cues; djl_cue_list       cues;
+    bool has_art;  djl_blob           art;
+    bool has_ss;   djl_song_structure ss;
+    bool has_sig;  uint8_t            sig[20];
+} fetch_result;
+
+static void result_free(fetch_result *f)
 {
-    /* All blocking work happens here, with no lock held. */
-    djl_db *db = NULL;
-    if (djl_db_open(ctx, host, &db) != DJL_OK) {
-        djl_log(ctx, DJL_LOG_WARN, "metadata: cannot open dbserver on player %u", host);
-        return;
+    if (f->has_wave) djl_waveform_free(&f->wave);
+    if (f->has_grid) djl_beat_grid_free(&f->grid);
+    if (f->has_cues) djl_cue_list_free(&f->cues);
+    if (f->has_art)  djl_blob_free(&f->art);
+    if (f->has_ss)   djl_song_structure_free(&f->ss);
+    memset(f, 0, sizeof *f);
+}
+
+/* Enough to be worth caching and to stop trying further providers. */
+static bool result_usable(const fetch_result *f)
+{
+    return f->has_meta || f->has_grid || f->has_cues || f->has_wave || f->has_ss;
+}
+
+static void sign_if_possible(fetch_result *f, const djl_waveform_blob *rgb_detail)
+{
+    if (f->has_sig || !f->has_grid || !rgb_detail || !rgb_detail->data) return;
+    if (rgb_detail->style != DJL_WAVE_RGB || !rgb_detail->detail) return;
+    if (djl_track_signature(f->has_meta ? f->meta.title : "",
+                            f->has_meta ? f->meta.artist : "",
+                            f->has_meta ? f->meta.duration_s : 0,
+                            rgb_detail, &f->grid, f->sig) == DJL_OK)
+        f->has_sig = true;
+}
+
+/* ---- provider: NFS (export.pdb + ANLZ off the player's own media) ---- */
+
+static bool fetch_via_nfs(djl_context *ctx, uint8_t host, djl_slot slot,
+                          djl_track_type type, uint32_t id, fetch_result *out)
+{
+    if (!djl_nfs_supported()) return false;
+    /* Only media that physically exists on disk. CD audio, streaming and
+     * rekordbox-collection tracks have no export.pdb to read. */
+    if (type != DJL_TRACK_REKORDBOX) return false;
+    if (slot != DJL_SLOT_SD && slot != DJL_SLOT_USB) return false;
+
+    djl_nfs *n = NULL;
+    djl_err e = djl_nfs_open(ctx, host, slot, &n);
+    if (e != DJL_OK) {
+        djl_log(ctx, DJL_LOG_DEBUG, "metadata: NFS mount on player %u failed: %s",
+                host, djl_strerror(e));
+        return false;
     }
 
-    djl_track_info   meta;  bool has_meta = djl_db_track_metadata(db, slot, type, id, &meta) == DJL_OK;
-    djl_waveform_blob wave; bool has_wave = djl_db_waveform(db, slot, type, id, DJL_WAVE_RGB, false, &wave) == DJL_OK;
-    djl_beat_grid    grid;  bool has_grid = djl_db_beat_grid(db, slot, type, id, &grid) == DJL_OK;
-    djl_cue_list     cues;  bool has_cues = djl_db_cue_list(db, slot, type, id, true, &cues) == DJL_OK;
-    if (!has_cues) has_cues = djl_db_cue_list(db, slot, type, id, false, &cues) == DJL_OK;
+    djl_nfs_track t;
+    e = djl_nfs_fetch_track(n, id, &t);
+    if (e != DJL_OK) {
+        djl_log(ctx, DJL_LOG_DEBUG, "metadata: NFS track %u failed: %s",
+                id, djl_strerror(e));
+        djl_nfs_close(n);
+        return false;
+    }
 
-    djl_blob art; bool has_art = false;
-    if (has_meta && meta.artwork_id)
-        has_art = djl_db_album_art(db, slot, type, meta.artwork_id, &art) == DJL_OK;
+    if (t.has_meta) { out->has_meta = true; out->meta = t.meta; }
+    /* Move ownership of the parsed analysis into the result. */
+    if (t.anlz.has_grid) { out->has_grid = true; out->grid = t.anlz.grid;
+                           memset(&t.anlz.grid, 0, sizeof t.anlz.grid); }
+    if (t.anlz.has_cues) { out->has_cues = true; out->cues = t.anlz.cues;
+                           memset(&t.anlz.cues, 0, sizeof t.anlz.cues); }
+    if (t.anlz.has_ss)   { out->has_ss = true; out->ss = t.anlz.ss;
+                           memset(&t.anlz.ss, 0, sizeof t.anlz.ss); }
+    if (t.anlz.has_preview) { out->has_wave = true; out->wave = t.anlz.preview;
+                              memset(&t.anlz.preview, 0, sizeof t.anlz.preview); }
 
-    djl_song_structure ss; bool has_ss = false;
-    if (type == DJL_TRACK_REKORDBOX)
-        has_ss = djl_db_song_structure(db, slot, type, id, &ss) == DJL_OK;
+    sign_if_possible(out, t.anlz.has_rgb_detail ? &t.anlz.rgb_detail : NULL);
+
+    if (out->has_meta && out->meta.artwork_id) {
+        djl_blob art;
+        if (djl_nfs_read_artwork(n, out->meta.artwork_id, &art) == DJL_OK) {
+            out->has_art = true; out->art = art;
+        }
+    }
+
+    djl_nfs_track_free(&t);
+    djl_nfs_close(n);
+    return result_usable(out);
+}
+
+/* ---- provider: dbserver (TCP; the only source for CD and streaming) ---- */
+
+static bool fetch_via_dbserver(djl_context *ctx, uint8_t host, djl_slot slot,
+                               djl_track_type type, uint32_t id, fetch_result *out)
+{
+    int own = djl_own_number(ctx);
+    if (own < 1 || own > 6 || (uint8_t)own == host) return false;
+
+    djl_db *db = NULL;
+    if (djl_db_open(ctx, host, &db) != DJL_OK) {
+        djl_log(ctx, DJL_LOG_DEBUG, "metadata: cannot open dbserver on player %u", host);
+        return false;
+    }
+
+    if (!out->has_meta)
+        out->has_meta = djl_db_track_metadata(db, slot, type, id, &out->meta) == DJL_OK;
+    if (!out->has_wave)
+        out->has_wave = djl_db_waveform(db, slot, type, id, DJL_WAVE_RGB, false, &out->wave) == DJL_OK;
+    if (!out->has_grid)
+        out->has_grid = djl_db_beat_grid(db, slot, type, id, &out->grid) == DJL_OK;
+    if (!out->has_cues) {
+        out->has_cues = djl_db_cue_list(db, slot, type, id, true, &out->cues) == DJL_OK;
+        if (!out->has_cues)
+            out->has_cues = djl_db_cue_list(db, slot, type, id, false, &out->cues) == DJL_OK;
+    }
+    if (!out->has_art && out->has_meta && out->meta.artwork_id)
+        out->has_art = djl_db_album_art(db, slot, type, out->meta.artwork_id, &out->art) == DJL_OK;
+    if (!out->has_ss && type == DJL_TRACK_REKORDBOX)
+        out->has_ss = djl_db_song_structure(db, slot, type, id, &out->ss) == DJL_OK;
 
     /* Signature needs RGB detail + grid + names; only rekordbox tracks have the
      * .EXT detail, so only attempt it there. */
-    uint8_t sig[20]; bool has_sig = false;
-    if (type == DJL_TRACK_REKORDBOX && has_grid) {
+    if (!out->has_sig && type == DJL_TRACK_REKORDBOX && out->has_grid) {
         djl_waveform_blob det;
         if (djl_db_waveform(db, slot, type, id, DJL_WAVE_RGB, true, &det) == DJL_OK) {
-            if (det.style == DJL_WAVE_RGB &&
-                djl_track_signature(has_meta ? meta.title : "", has_meta ? meta.artist : "",
-                                    has_meta ? meta.duration_s : 0, &det, &grid, sig) == DJL_OK)
-                has_sig = true;
+            sign_if_possible(out, &det);
             djl_waveform_free(&det);
         }
     }
 
     djl_db_close(db);
+    return result_usable(out);
+}
+
+static void perform_fetch(djl_context *ctx, uint8_t player, uint8_t host,
+                          djl_slot slot, djl_track_type type, uint32_t id)
+{
+    /* All blocking work happens here, with no lock held. Providers are tried in
+     * the configured order and may complement each other: NFS yields the whole
+     * ANLZ set including PSSI, dbserver covers media with no files on disk. */
+    djl_provider_kind order[DJL_MAX_PROVIDERS];
+    size_t norder;
+    pthread_mutex_lock(&ctx->lock);
+    norder = ctx->provider_count;
+    memcpy(order, ctx->providers, sizeof order);
+    pthread_mutex_unlock(&ctx->lock);
+
+    fetch_result res;
+    memset(&res, 0, sizeof res);
+    bool via_nfs = false, via_db = false;
+
+    for (size_t i = 0; i < norder; i++) {
+        bool ok = false;
+        switch (order[i]) {
+        case DJL_PROVIDER_NFS:
+            ok = fetch_via_nfs(ctx, host, slot, type, id, &res);
+            via_nfs = via_nfs || ok;
+            break;
+        case DJL_PROVIDER_DBSERVER:
+            ok = fetch_via_dbserver(ctx, host, slot, type, id, &res);
+            via_db = via_db || ok;
+            break;
+        default:
+            break;
+        }
+        /* Stop as soon as we have a complete-enough picture; otherwise let the
+         * next provider fill the gaps. */
+        if (ok && res.has_meta && res.has_grid && res.has_cues) break;
+    }
+    const char *source = via_nfs ? (via_db ? "nfs+dbserver" : "nfs")
+                                 : (via_db ? "dbserver" : "none");
+
+    if (!result_usable(&res)) {
+        djl_log(ctx, DJL_LOG_WARN, "metadata: no provider could serve player %u track %u",
+                player, id);
+        result_free(&res);
+        return;
+    }
+
+    djl_track_info    meta = res.meta;
+    djl_waveform_blob wave = res.wave;
+    djl_beat_grid     grid = res.grid;
+    djl_cue_list      cues = res.cues;
+    djl_blob          art  = res.art;
+    djl_song_structure ss  = res.ss;
+    bool has_meta = res.has_meta, has_wave = res.has_wave, has_grid = res.has_grid;
+    bool has_cues = res.has_cues, has_art = res.has_art, has_ss = res.has_ss;
+    bool has_sig  = res.has_sig;
+    uint8_t sig[20];
+    memcpy(sig, res.sig, 20);
+    djl_log(ctx, DJL_LOG_DEBUG, "metadata: player %u track %u served by %s",
+            player, id, source);
 
     /* Publish into the cache and notify. */
     pthread_mutex_lock(&ctx->lock);
@@ -163,6 +317,33 @@ static void *meta_thread_fn(void *arg)
     }
     pthread_mutex_unlock(&ctx->lock);
     return NULL;
+}
+
+/* ---- provider order ---- */
+
+djl_err djl_metadata_set_provider_order(djl_context *ctx,
+                                        const djl_provider_kind *order, size_t n)
+{
+    if (!ctx || !order || n == 0 || n > DJL_MAX_PROVIDERS) return DJL_ERR_INVAL;
+    for (size_t i = 0; i < n; i++)
+        if (order[i] != DJL_PROVIDER_DBSERVER && order[i] != DJL_PROVIDER_NFS)
+            return DJL_ERR_INVAL;
+    pthread_mutex_lock(&ctx->lock);
+    memset(ctx->providers, 0, sizeof ctx->providers);
+    memcpy(ctx->providers, order, n * sizeof *order);
+    ctx->provider_count = n;
+    pthread_mutex_unlock(&ctx->lock);
+    return DJL_OK;
+}
+
+size_t djl_metadata_get_provider_order(djl_context *ctx, djl_provider_kind *out, size_t max)
+{
+    if (!ctx || !out) return 0;
+    pthread_mutex_lock(&ctx->lock);
+    size_t n = ctx->provider_count < max ? ctx->provider_count : max;
+    for (size_t i = 0; i < n; i++) out[i] = ctx->providers[i];
+    pthread_mutex_unlock(&ctx->lock);
+    return n;
 }
 
 /* ---- lifecycle ---- */

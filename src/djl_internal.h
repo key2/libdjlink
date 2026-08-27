@@ -31,6 +31,13 @@ int     djl_sock_recv(djl_sock *s, uint8_t *buf, size_t cap, uint8_t src_ip[4]);
 djl_err djl_sock_send(djl_sock *s, const uint8_t ip[4], uint16_t port,
                       const uint8_t *buf, size_t len);
 
+/* Client UDP socket bound to an ephemeral port, for the NFS/RPC client.
+ * Pioneer's NFS does not require a privileged source port. */
+djl_err djl_udp_open(djl_sock *s);
+/* Blocking receive with a millisecond timeout. Returns bytes, 0 on timeout,
+ * negative on error. */
+int     djl_udp_recv_wait(djl_sock *s, uint8_t *buf, size_t cap, unsigned timeout_ms);
+
 /* ---------------- packet templates ---------------- */
 
 /* Each builder writes into buf (cap must be >= the documented size) and
@@ -154,6 +161,8 @@ struct djl_context {
                     meta_jobs[16];
     size_t          meta_job_head, meta_job_tail;
     struct djl_meta_entry *meta_cache;   /* [64], heap to keep this struct lean */
+    djl_provider_kind providers[DJL_MAX_PROVIDERS];
+    size_t          provider_count;
 
     /* our advertised state */
     bool            adv_playing, adv_master, adv_synced, adv_on_air;

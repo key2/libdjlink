@@ -9,6 +9,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <poll.h>
 
 #include <sys/socket.h>
 #include <sys/ioctl.h>
@@ -183,4 +184,51 @@ djl_err djl_sock_send(djl_sock *s, const uint8_t ip[4], uint16_t port,
     ssize_t n = sendto(s->fd, buf, len, 0, (struct sockaddr *)&to, sizeof to);
     if (n < 0) return DJL_ERR_IO;
     return DJL_OK;
+}
+
+/* ---------------- client UDP (RPC / NFS) ---------------- */
+
+djl_err djl_udp_open(djl_sock *s)
+{
+    if (!s) return DJL_ERR_INVAL;
+    s->fd = -1;
+    s->port = 0;
+
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return DJL_ERR_IO;
+
+    /* Bind an ephemeral source port. Pioneer's NFS server, unlike some Unix
+     * ones, does not insist on a reserved (<1024) source port. */
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family      = AF_INET;
+    addr.sin_port        = 0;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof addr) != 0) {
+        close(fd);
+        return DJL_ERR_IO;
+    }
+
+    struct sockaddr_in got;
+    socklen_t gl = sizeof got;
+    if (getsockname(fd, (struct sockaddr *)&got, &gl) == 0)
+        s->port = ntohs(got.sin_port);
+
+    s->fd = fd;
+    return DJL_OK;
+}
+
+int djl_udp_recv_wait(djl_sock *s, uint8_t *buf, size_t cap, unsigned timeout_ms)
+{
+    if (!s || s->fd < 0 || !buf) return -1;
+    struct pollfd pfd;
+    pfd.fd = s->fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    int pr = poll(&pfd, 1, (int)timeout_ms);
+    if (pr == 0) return 0;                     /* timed out */
+    if (pr < 0) return (errno == EINTR) ? 0 : -1;
+    ssize_t n = recv(s->fd, buf, cap, 0);
+    if (n < 0) return (errno == EAGAIN || errno == EWOULDBLOCK) ? 0 : -1;
+    return (int)n;
 }

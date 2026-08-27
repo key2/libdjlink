@@ -749,6 +749,122 @@ DJL_API djl_err djl_track_signature(const char *title, const char *artist,
                                     const djl_waveform_blob *rgb_detail,
                                     const djl_beat_grid *grid, uint8_t out_sha1[20]);
 
+/* ------------------------------------------------------------------ */
+/* ANLZ: rekordbox analysis files (.DAT / .EXT / .2EX). Pure parser.    */
+/* ------------------------------------------------------------------ */
+
+/* Everything a set of ANLZ files can tell us about one track. Parsing is
+ * additive: call djl_anlz_parse once per file (.DAT, then .EXT, then .2EX) on
+ * the same struct and the richer tags supersede the poorer ones the way
+ * rekordbox intends (PCO2 over PCOB, 3-band/RGB over blue). */
+typedef struct {
+    bool has_grid;    djl_beat_grid      grid;      /* PQTZ */
+    bool has_cues;    djl_cue_list       cues;      /* PCOB / PCO2 */
+    bool has_ss;      djl_song_structure ss;        /* PSSI */
+    bool has_preview; djl_waveform_blob  preview;   /* best: PWV6 > PWV4 > PWAV */
+    bool has_detail;  djl_waveform_blob  detail;    /* best: PWV7 > PWV5 > PWV3 */
+    /* The track signature is defined over the RGB detail waveform specifically,
+     * so keep PWV5 even when the 3-band PWV7 supersedes it for display. */
+    bool has_rgb_detail; djl_waveform_blob rgb_detail;
+    char path[512];                                 /* PPTH: audio file path */
+} djl_anlz;
+
+/* Parse one PMAI file, merging into *inout (zero it before the first call). */
+DJL_API djl_err djl_anlz_parse(const uint8_t *data, size_t len, djl_anlz *inout);
+DJL_API void    djl_anlz_free(djl_anlz *a);
+
+/* ------------------------------------------------------------------ */
+/* DeviceSQL export.pdb reader. Pure; borrows the caller's buffer.      */
+/* ------------------------------------------------------------------ */
+
+typedef struct djl_pdb djl_pdb;
+
+/* data must stay valid and unmodified until djl_pdb_close. */
+DJL_API djl_err djl_pdb_open(const uint8_t *data, size_t len, djl_pdb **out);
+DJL_API void    djl_pdb_close(djl_pdb *p);
+
+DJL_API size_t  djl_pdb_track_count(const djl_pdb *p);
+DJL_API djl_err djl_pdb_track_id_at(const djl_pdb *p, size_t index, uint32_t *out_id);
+
+/* Full metadata for one track id, with cross-table names resolved. If
+ * anlz_path is non-NULL it receives the .DAT analysis path from the row. */
+DJL_API djl_err djl_pdb_track(const djl_pdb *p, uint32_t track_id,
+                              djl_track_info *out, char *anlz_path, size_t anlz_path_sz);
+
+/* Album-art file path for an artwork id (from djl_track_info.artwork_id). */
+DJL_API djl_err djl_pdb_artwork_path(const djl_pdb *p, uint32_t artwork_id,
+                                     char *out, size_t outsz);
+
+/* ------------------------------------------------------------------ */
+/* NFS client: read a player's own USB/SD directly (DJL_WITH_NFS)       */
+/* ------------------------------------------------------------------ */
+
+typedef struct djl_nfs djl_nfs;
+
+/* False if the library was built without DJL_WITH_NFS, in which case every
+ * djl_nfs_* call returns DJL_ERR_UNAVAILABLE. */
+DJL_API bool djl_nfs_supported(void);
+
+/* Mount a player's media over NFS. slot must be DJL_SLOT_SD or DJL_SLOT_USB.
+ * Works at any device number, including when four real players occupy 1..4,
+ * and needs no dbserver. Blocking; call from a worker thread. */
+DJL_API djl_err djl_nfs_open(djl_context *ctx, uint8_t player, djl_slot slot, djl_nfs **out);
+DJL_API djl_err djl_nfs_open_addr(const uint8_t ip[4], djl_slot slot, djl_nfs **out);
+DJL_API void    djl_nfs_close(djl_nfs *n);
+
+/* Read a whole file, e.g. "PIONEER/rekordbox/export.pdb". Paths are relative
+ * to the slot root; the library handles the UTF-16LE encoding Pioneer's NFS
+ * requires and the hidden ".PIONEER" folder on HFS+ media. */
+DJL_API djl_err djl_nfs_read_file(djl_nfs *n, const char *path, djl_blob *out);
+
+typedef struct {
+    char     name[256];
+    uint32_t fileid;
+} djl_nfs_dirent;
+
+DJL_API djl_err djl_nfs_list_dir(djl_nfs *n, const char *path,
+                                 djl_nfs_dirent *out, size_t max, size_t *count);
+
+/* The slot's export.pdb, downloaded and parsed on first use, then cached in
+ * the handle. The returned reader stays owned by the handle. */
+DJL_API djl_err djl_nfs_pdb(djl_nfs *n, const djl_pdb **out);
+
+typedef struct {
+    bool     has_meta;
+    djl_track_info meta;
+    djl_anlz anlz;
+    char     anlz_path[512];   /* the .DAT path the PDB pointed at */
+} djl_nfs_track;
+
+/* Resolve a rekordbox track id through export.pdb, then download and parse its
+ * .DAT, .EXT and .2EX analysis files. This is the one call that yields
+ * metadata + beat grid + cues + phrases + waveforms from a single source. */
+DJL_API djl_err djl_nfs_fetch_track(djl_nfs *n, uint32_t track_id, djl_nfs_track *out);
+DJL_API void    djl_nfs_track_free(djl_nfs_track *t);
+
+/* Album art (JPEG) for an artwork id, read straight off the media. */
+DJL_API djl_err djl_nfs_read_artwork(djl_nfs *n, uint32_t artwork_id, djl_blob *out);
+
+/* ------------------------------------------------------------------ */
+/* Metadata provider order                                             */
+/* ------------------------------------------------------------------ */
+
+typedef enum {
+    DJL_PROVIDER_NONE     = 0,
+    DJL_PROVIDER_DBSERVER = 1,   /* TCP; needs our number in 1..4 (or <=6) */
+    DJL_PROVIDER_NFS      = 2    /* export.pdb + ANLZ; any device number */
+} djl_provider_kind;
+
+#define DJL_MAX_PROVIDERS 4
+
+/* Order the auto-fetch manager tries providers in. Default is NFS then
+ * dbserver: NFS works regardless of device number and returns PSSI reliably,
+ * while dbserver is the only source for CD audio and streaming tracks. */
+DJL_API djl_err djl_metadata_set_provider_order(djl_context *ctx,
+                                                const djl_provider_kind *order, size_t n);
+DJL_API size_t  djl_metadata_get_provider_order(djl_context *ctx,
+                                                djl_provider_kind *out, size_t max);
+
 #ifdef __cplusplus
 }
 #endif
