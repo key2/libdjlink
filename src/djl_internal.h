@@ -3,6 +3,7 @@
 
 #include "djlink.h"
 #include <pthread.h>
+#include <stdint.h>
 
 /* ---------------- OSAL ---------------- */
 
@@ -19,9 +20,15 @@ djl_err  djl_iface_lookup(const char *name, djl_iface *out);
 /* declared in djlink.h */
 void     djl_sleep_ms(unsigned ms);
 
+/* A socket handle. Windows SOCKET is a UINT_PTR, which does not fit in an int
+ * on 64-bit, so carry it as intptr_t: INVALID_SOCKET round-trips to -1 and a
+ * POSIX descriptor fits unchanged, so "fd < 0 means invalid" holds on both. */
+typedef intptr_t djl_fd;
+#define DJL_BAD_FD ((djl_fd)-1)
+
 /* A bound UDP socket. */
 typedef struct {
-    int      fd;
+    djl_fd   fd;
     uint16_t port;
 } djl_sock;
 
@@ -31,12 +38,26 @@ int     djl_sock_recv(djl_sock *s, uint8_t *buf, size_t cap, uint8_t src_ip[4]);
 djl_err djl_sock_send(djl_sock *s, const uint8_t ip[4], uint16_t port,
                       const uint8_t *buf, size_t len);
 
+/* Wait until at least one of n sockets is readable. ready[i] is set for each
+ * readable socket. Returns the count ready, 0 on timeout, negative on error. */
+int     djl_sock_poll(djl_sock *const *socks, size_t n, unsigned timeout_ms,
+                      bool *ready);
+
 /* Client UDP socket bound to an ephemeral port, for the NFS/RPC client.
  * Pioneer's NFS does not require a privileged source port. */
 djl_err djl_udp_open(djl_sock *s);
 /* Blocking receive with a millisecond timeout. Returns bytes, 0 on timeout,
  * negative on error. */
 int     djl_udp_recv_wait(djl_sock *s, uint8_t *buf, size_t cap, unsigned timeout_ms);
+
+/* Blocking TCP client, for the dbserver protocol. Keeps every socket call in
+ * the OSAL so dbserver.c stays platform-independent. */
+typedef struct { djl_fd fd; } djl_tcp;
+
+djl_err djl_tcp_connect(djl_tcp *t, const uint8_t ip[4], uint16_t port, int timeout_ms);
+void    djl_tcp_close(djl_tcp *t);
+djl_err djl_tcp_send_all(djl_tcp *t, const uint8_t *buf, size_t len);
+djl_err djl_tcp_recv_exact(djl_tcp *t, uint8_t *buf, size_t len);
 
 /* ---------------- packet templates ---------------- */
 

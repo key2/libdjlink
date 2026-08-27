@@ -11,7 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
-#include <poll.h>
+
 #include <math.h>
 
 /* Timing constants (see ARCHITECTURE.md section 5). */
@@ -735,23 +735,20 @@ static void *io_thread(void *arg)
     djl_context *ctx = (djl_context *)arg;
     uint8_t buf[DJL_MAX_PACKET];
 
-    struct pollfd pfd[4];
-    pfd[0].fd = ctx->sock_announce.fd; pfd[0].events = POLLIN;
-    pfd[1].fd = ctx->sock_beat.fd;     pfd[1].events = POLLIN;
-    pfd[2].fd = ctx->sock_status.fd;   pfd[2].events = POLLIN;
-    pfd[3].fd = ctx->sock_audio.fd;    pfd[3].events = POLLIN;
+    djl_sock *const socks[4] = {
+        &ctx->sock_announce, &ctx->sock_beat, &ctx->sock_status, &ctx->sock_audio
+    };
 
     while (ctx->running) {
-        int r = poll(pfd, 4, 20);
+        bool ready[4];
+        int r = djl_sock_poll(socks, 4, 20, ready);
         uint64_t now = djl_now_ms();
 
         if (r > 0) {
             pthread_mutex_lock(&ctx->lock);
             for (int i = 0; i < 4; i++) {
-                if (!(pfd[i].revents & POLLIN)) continue;
-                djl_sock *s = (i == 0) ? &ctx->sock_announce :
-                              (i == 1) ? &ctx->sock_beat :
-                              (i == 2) ? &ctx->sock_status : &ctx->sock_audio;
+                if (!ready[i]) continue;
+                djl_sock *s = socks[i];
                 for (;;) {
                     uint8_t src[4] = {0,0,0,0};
                     int n = djl_sock_recv(s, buf, sizeof buf, src);
@@ -837,7 +834,8 @@ djl_err djl_context_create(const djl_config *cfg, djl_context **out)
     memcpy(ctx->id.name, ctx->name_buf, strnlen(ctx->name_buf, DJL_NAME_LEN));
     memcpy(ctx->id.mac, ctx->iface.mac, 6);
     memcpy(ctx->id.ip,  ctx->iface.ip,  4);
-    ctx->id.device_type   = cfg->advertise_as ? cfg->advertise_as : DJL_DEVTYPE_CDJ;
+    ctx->id.device_type   = (uint8_t)(cfg->advertise_as ? cfg->advertise_as
+                                                        : DJL_DEVTYPE_CDJ);
     ctx->id.model_code    = cfg->model_code;
     ctx->id.proto_version = cfg->proto_version ? cfg->proto_version : 0x03;
     ctx->id.peer_count    = 1;

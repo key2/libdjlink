@@ -7,7 +7,11 @@
  * (PIONEER/USBANLZ/P012/0000973C/ANLZ0001.DAT, 2026-08-27).
  */
 #include "djlink.h"
+/* The XDR and RPC halves only exist when the NFS client is built; the PDB and
+ * ANLZ readers are always present, so their tests run either way. */
+#if defined(DJL_WITH_NFS)
 #include "nfs/nfs_internal.h"
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -46,6 +50,7 @@ extern int  djl_test_failures;
     }                                                                  \
 } while (0)
 
+#if defined(DJL_WITH_NFS)
 /* ---------------- XDR ---------------- */
 
 static void test_xdr_roundtrip(void)
@@ -205,6 +210,8 @@ static void test_rpc_reply_parse(void)
     djl_rpc_build_call(&w, 7, DJL_PROG_NFS, 2, 4);
     CHECK_EQ_U(djl_rpc_reply_body(buf, w.len, 7, &off), DJL_ERR_IO);
 }
+
+#endif /* DJL_WITH_NFS */
 
 /* ---------------- ANLZ fixtures ---------------- */
 
@@ -612,6 +619,7 @@ static void test_fuzz_parsers(void)
             }
         }
 
+#if defined(DJL_WITH_NFS)
         /* XDR readers over arbitrary bytes. */
         djl_xdr_r r;
         djl_xdr_r_init(&r, buf, len);
@@ -622,6 +630,7 @@ static void test_fuzz_parsers(void)
         }
         size_t off = 0;
         (void)djl_rpc_reply_body(buf, len, 0x1234u, &off);
+#endif
     }
     djl_test_checks++;
     printf("  fuzz: 30000 NFS/PDB/ANLZ iterations completed without crashing\n");
@@ -630,11 +639,13 @@ static void test_fuzz_parsers(void)
 void djl_test_nfs(void);
 void djl_test_nfs(void)
 {
+#if defined(DJL_WITH_NFS)
     test_xdr_roundtrip();
     test_xdr_bounds();
     test_utf16le();
     test_rpc_call_header();
     test_rpc_reply_parse();
+#endif
     test_anlz_beat_grid();
     test_anlz_cues();
     test_anlz_waveforms();

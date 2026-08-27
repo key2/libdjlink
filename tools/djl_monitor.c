@@ -179,7 +179,7 @@ static void handle(const djl_event *ev, djl_context *ctx)
                m->track_count, m->playlist_count,
                djl_track_type_name(m->track_type),
                m->has_my_settings ? "yes" : "no",
-               m->free_bytes / 1e9, m->total_bytes / 1e9);
+               (double)m->free_bytes / 1e9, (double)m->total_bytes / 1e9);
         break;
     }
     case DJL_EV_CDJ_STATUS: {

@@ -15,14 +15,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <errno.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <poll.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <arpa/inet.h>
 
 #define DB_QUERY_PORT   12523
 #define DB_MAGIC        0x872349aeu
@@ -42,7 +34,7 @@
 #define EXT_2EX  0x00584532u  /* "2EX" */
 
 struct djl_db {
-    int      fd;
+    djl_tcp  sock;
     uint8_t  target;
     uint8_t  posing;
     uint8_t  their_number;
@@ -93,61 +85,16 @@ static uint8_t arg_tag(const db_arg *a)
 }
 
 /* -------------------- TCP helpers -------------------- */
+/* All socket work goes through the OSAL so this file stays portable. */
 
-static djl_err tcp_connect(const uint8_t ip[4], uint16_t port, int timeout_ms, int *out_fd)
+static djl_err read_exact(djl_tcp *t, uint8_t *buf, size_t n)
 {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return DJL_ERR_IO;
-    int fl = fcntl(fd, F_GETFL, 0);
-    fcntl(fd, F_SETFL, fl | O_NONBLOCK);
-
-    struct sockaddr_in to;
-    memset(&to, 0, sizeof to);
-    to.sin_family = AF_INET;
-    to.sin_port = htons(port);
-    memcpy(&to.sin_addr.s_addr, ip, 4);
-
-    int r = connect(fd, (struct sockaddr *)&to, sizeof to);
-    if (r != 0 && errno == EINPROGRESS) {
-        struct pollfd pfd = { fd, POLLOUT, 0 };
-        if (poll(&pfd, 1, timeout_ms) <= 0) { close(fd); return DJL_ERR_TIMEOUT; }
-        int soerr = 0; socklen_t sl = sizeof soerr;
-        getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &sl);
-        if (soerr != 0) { close(fd); return DJL_ERR_IO; }
-    } else if (r != 0) {
-        close(fd); return DJL_ERR_IO;
-    }
-    fcntl(fd, F_SETFL, fl);   /* back to blocking */
-
-    struct timeval tv = { timeout_ms / 1000, (timeout_ms % 1000) * 1000 };
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
-    int one = 1; setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-    *out_fd = fd;
-    return DJL_OK;
+    return djl_tcp_recv_exact(t, buf, n);
 }
 
-static djl_err read_exact(int fd, uint8_t *buf, size_t n)
+static djl_err write_all(djl_tcp *t, const uint8_t *buf, size_t n)
 {
-    size_t got = 0;
-    while (got < n) {
-        ssize_t r = recv(fd, buf + got, n - got, 0);
-        if (r == 0) return DJL_ERR_IO;
-        if (r < 0) { if (errno == EINTR) continue; return DJL_ERR_TIMEOUT; }
-        got += (size_t)r;
-    }
-    return DJL_OK;
-}
-
-static djl_err write_all(int fd, const uint8_t *buf, size_t n)
-{
-    size_t sent = 0;
-    while (sent < n) {
-        ssize_t r = send(fd, buf + sent, n - sent, MSG_NOSIGNAL);
-        if (r <= 0) { if (r < 0 && errno == EINTR) continue; return DJL_ERR_IO; }
-        sent += (size_t)r;
-    }
-    return DJL_OK;
+    return djl_tcp_send_all(t, buf, n);
 }
 
 /* -------------------- parsed fields / messages -------------------- */
@@ -184,36 +131,36 @@ static void utf16be_to_utf8(const uint8_t *src, size_t units, char *out, size_t 
 }
 
 /* Read one field. For strings, decodes to a freshly malloc'd UTF-8 string. */
-static djl_err read_field(int fd, db_field *f)
+static djl_err read_field(djl_tcp *t, db_field *f)
 {
     memset(f, 0, sizeof *f);
     uint8_t tag;
-    djl_err e = read_exact(fd, &tag, 1);
+    djl_err e = read_exact(t, &tag, 1);
     if (e != DJL_OK) return e;
     f->tag = tag;
     uint8_t tmp[4];
     switch (tag) {
-    case 0x0f: if ((e=read_exact(fd,tmp,1))) return e; f->num = tmp[0]; return DJL_OK;
-    case 0x10: if ((e=read_exact(fd,tmp,2))) return e; f->num = ((uint32_t)tmp[0]<<8)|tmp[1]; return DJL_OK;
-    case 0x11: if ((e=read_exact(fd,tmp,4))) return e;
+    case 0x0f: if ((e=read_exact(t,tmp,1))) return e; f->num = tmp[0]; return DJL_OK;
+    case 0x10: if ((e=read_exact(t,tmp,2))) return e; f->num = ((uint32_t)tmp[0]<<8)|tmp[1]; return DJL_OK;
+    case 0x11: if ((e=read_exact(t,tmp,4))) return e;
         f->num = ((uint64_t)tmp[0]<<24)|((uint32_t)tmp[1]<<16)|((uint32_t)tmp[2]<<8)|tmp[3]; return DJL_OK;
     case 0x14: {
-        if ((e=read_exact(fd,tmp,4))) return e;
+        if ((e=read_exact(t,tmp,4))) return e;
         uint32_t n = ((uint32_t)tmp[0]<<24)|((uint32_t)tmp[1]<<16)|((uint32_t)tmp[2]<<8)|tmp[3];
         if (n > 8u*1024*1024) return DJL_ERR_IO;   /* sanity cap */
         f->blob = n ? malloc(n) : NULL;
         if (n && !f->blob) return DJL_ERR_NOMEM;
-        if (n && (e=read_exact(fd,f->blob,n))) { free(f->blob); f->blob=NULL; return e; }
+        if (n && (e=read_exact(t,f->blob,n))) { free(f->blob); f->blob=NULL; return e; }
         f->blen = n;
         return DJL_OK;
     }
     case 0x26: {
-        if ((e=read_exact(fd,tmp,4))) return e;
+        if ((e=read_exact(t,tmp,4))) return e;
         uint32_t units = ((uint32_t)tmp[0]<<24)|((uint32_t)tmp[1]<<16)|((uint32_t)tmp[2]<<8)|tmp[3];
         if (units > 1024*1024) return DJL_ERR_IO;
         uint8_t *raw = units ? malloc((size_t)units*2) : NULL;
         if (units && !raw) return DJL_ERR_NOMEM;
-        if (units && (e=read_exact(fd,raw,(size_t)units*2))) { free(raw); return e; }
+        if (units && (e=read_exact(t,raw,(size_t)units*2))) { free(raw); return e; }
         f->str = malloc((size_t)units*3 + 1);
         if (!f->str) { free(raw); return DJL_ERR_NOMEM; }
         utf16be_to_utf8(raw, units, f->str, (size_t)units*3 + 1);
@@ -226,30 +173,30 @@ static djl_err read_field(int fd, db_field *f)
     }
 }
 
-static djl_err read_message(int fd, db_message *m)
+static djl_err read_message(djl_tcp *t, db_message *m)
 {
     memset(m, 0, sizeof *m);
     db_field f;
     djl_err e;
 
-    if ((e = read_field(fd, &f))) return e;
+    if ((e = read_field(t, &f))) return e;
     if (f.tag != 0x11 || f.num != DB_MAGIC) { field_free(&f); return DJL_ERR_IO; }
     field_free(&f);
 
-    if ((e = read_field(fd, &f))) return e;
+    if ((e = read_field(t, &f))) return e;
     if (f.tag != 0x11) { field_free(&f); return DJL_ERR_IO; }
     m->txid = (uint32_t)f.num; field_free(&f);
 
-    if ((e = read_field(fd, &f))) return e;
+    if ((e = read_field(t, &f))) return e;
     if (f.tag != 0x10) { field_free(&f); return DJL_ERR_IO; }
     m->type = (uint16_t)f.num; field_free(&f);
 
-    if ((e = read_field(fd, &f))) return e;
+    if ((e = read_field(t, &f))) return e;
     if (f.tag != 0x0f) { field_free(&f); return DJL_ERR_IO; }
     m->argcount = (uint8_t)f.num; field_free(&f);
     if (m->argcount > 12) return DJL_ERR_IO;
 
-    if ((e = read_field(fd, &f))) return e;
+    if ((e = read_field(t, &f))) return e;
     if (f.tag != 0x14 || f.blen < m->argcount) { field_free(&f); return DJL_ERR_IO; }
     uint8_t tags[12] = {0};
     if (m->argcount && f.blob) memcpy(tags, f.blob, m->argcount);
@@ -261,7 +208,7 @@ static djl_err read_message(int fd, db_message *m)
             m->args[i].tag = 0x14;   /* omitted empty blob */
             m->args[i].blen = 0;
         } else {
-            if ((e = read_field(fd, &m->args[i]))) { msg_free(m); return e; }
+            if ((e = read_field(t, &m->args[i]))) { msg_free(m); return e; }
         }
         last_tag = m->args[i].tag;
         last_num = m->args[i].num;
@@ -297,7 +244,7 @@ static djl_err send_message(struct djl_db *d, uint32_t txid, uint16_t type,
         }
     }
     if (b.err) { free(b.p); return DJL_ERR_NOMEM; }
-    djl_err e = write_all(d->fd, b.p, b.len);
+    djl_err e = write_all(&d->sock, b.p, b.len);
     free(b.p);
     return e;
 }
@@ -310,7 +257,7 @@ static djl_err request(struct djl_db *d, uint16_t type, const db_arg *args, int 
     uint32_t txid = ++d->txid;
     djl_err e = send_message(d, txid, type, args, nargs);
     if (e != DJL_OK) { d->dead = 1; return e; }
-    e = read_message(d->fd, resp);
+    e = read_message(&d->sock, resp);
     if (e != DJL_OK) { d->dead = 1; return e; }
     if (resp->txid != txid) { msg_free(resp); d->dead = 1; return DJL_ERR_IO; }
     return DJL_OK;
@@ -320,19 +267,19 @@ static djl_err request(struct djl_db *d, uint16_t type, const db_arg *args, int 
 
 static djl_err port_lookup(const uint8_t ip[4], uint16_t *out_port)
 {
-    int fd;
-    djl_err e = tcp_connect(ip, DB_QUERY_PORT, DB_TIMEOUT_MS, &fd);
+    djl_tcp sock;
+    djl_err e = djl_tcp_connect(&sock, ip, DB_QUERY_PORT, DB_TIMEOUT_MS);
     if (e != DJL_OK) return e;
     /* 00 00 00 0f 52 65 6d 6f 74 65 44 42 53 65 72 76 65 72 00 */
     static const uint8_t q[] = { 0x00,0x00,0x00,0x0f,
         'R','e','m','o','t','e','D','B','S','e','r','v','e','r', 0x00 };
-    e = write_all(fd, q, sizeof q);
+    e = write_all(&sock, q, sizeof q);
     if (e == DJL_OK) {
         uint8_t r[2];
-        e = read_exact(fd, r, 2);
+        e = read_exact(&sock, r, 2);
         if (e == DJL_OK) *out_port = (uint16_t)((r[0] << 8) | r[1]);
     }
-    close(fd);
+    djl_tcp_close(&sock);
     return e;
 }
 
@@ -351,24 +298,24 @@ djl_err djl_db_open(djl_context *ctx, uint8_t player, djl_db **out)
     if (e != DJL_OK) return e;
     if (port == 0 || port == DB_QUERY_PORT) return DJL_ERR_UNAVAILABLE;
 
-    int fd;
-    e = tcp_connect(info.ip, port, DB_TIMEOUT_MS, &fd);
+    djl_tcp sock;
+    e = djl_tcp_connect(&sock, info.ip, port, DB_TIMEOUT_MS);
     if (e != DJL_OK) return e;
 
     struct djl_db *d = calloc(1, sizeof *d);
-    if (!d) { close(fd); return DJL_ERR_NOMEM; }
-    d->fd = fd; d->target = player; d->posing = (uint8_t)posing; d->port = port;
+    if (!d) { djl_tcp_close(&sock); return DJL_ERR_NOMEM; }
+    d->sock = sock; d->target = player; d->posing = (uint8_t)posing; d->port = port;
 
     /* Greeting: a 4-byte number field with value 1, echoed back. */
     obuf g = {0}; fld_num(&g, 1);
-    e = write_all(fd, g.p, g.len); free(g.p);
+    e = write_all(&d->sock, g.p, g.len); free(g.p);
     if (e == DJL_OK) {
         db_field f;
-        e = read_field(fd, &f);
+        e = read_field(&d->sock, &f);
         if (e == DJL_OK && (f.tag != 0x11 || f.num != 1)) e = DJL_ERR_IO;
         field_free(&f);
     }
-    if (e != DJL_OK) { close(fd); free(d); return e; }
+    if (e != DJL_OK) { djl_tcp_close(&d->sock); free(d); return e; }
 
     /* Setup: type 0x0000, txid 0xfffffffe, one arg = our device number. */
     db_arg a = { A_NUM, (uint32_t)posing, NULL, NULL, 0 };
@@ -379,18 +326,18 @@ djl_err djl_db_open(djl_context *ctx, uint8_t player, djl_db **out)
     ob_u8(&sb, 0x0f); ob_be(&sb, 1, 1);
     fld_blob(&sb, tags, 12);
     fld_num(&sb, a.num);
-    e = sb.err ? DJL_ERR_NOMEM : write_all(fd, sb.p, sb.len);
+    e = sb.err ? DJL_ERR_NOMEM : write_all(&d->sock, sb.p, sb.len);
     free(sb.p);
     if (e == DJL_OK) {
         db_message m;
-        e = read_message(fd, &m);
+        e = read_message(&d->sock, &m);
         if (e == DJL_OK) {
             if (m.type != 0x4000 || m.argcount < 2) e = DJL_ERR_IO;
             else d->their_number = (uint8_t)m.args[1].num;
             msg_free(&m);
         }
     }
-    if (e != DJL_OK) { close(fd); free(d); return e; }
+    if (e != DJL_OK) { djl_tcp_close(&d->sock); free(d); return e; }
 
     *out = d;
     return DJL_OK;
@@ -399,7 +346,7 @@ djl_err djl_db_open(djl_context *ctx, uint8_t player, djl_db **out)
 void djl_db_close(djl_db *d)
 {
     if (!d) return;
-    if (d->fd >= 0) {
+    if (d->sock.fd >= 0) {
         /* Teardown: type 0x0100, txid 0xfffffffe, no arguments. */
         obuf b = {0};
         uint8_t tags[12] = {0};
@@ -407,9 +354,9 @@ void djl_db_close(djl_db *d)
         ob_u8(&b, 0x10); ob_be(&b, 0x0100, 2);
         ob_u8(&b, 0x0f); ob_be(&b, 0, 1);
         fld_blob(&b, tags, 12);
-        if (!b.err) write_all(d->fd, b.p, b.len);
+        if (!b.err) write_all(&d->sock, b.p, b.len);
         free(b.p);
-        close(d->fd);
+        djl_tcp_close(&d->sock);
     }
     free(d);
 }
@@ -444,19 +391,19 @@ static djl_err render_menu(struct djl_db *d, uint32_t rmst_val, uint32_t total,
         if (e != DJL_OK) { d->dead = 1; return e; }
 
         db_message m;
-        e = read_message(d->fd, &m);           /* MENU_HEADER 0x4001 */
+        e = read_message(&d->sock, &m);           /* MENU_HEADER 0x4001 */
         if (e != DJL_OK) { d->dead = 1; return e; }
         if (m.type != 0x4001) { msg_free(&m); d->dead = 1; return DJL_ERR_IO; }
         msg_free(&m);
 
         for (uint32_t i = 0; i < batch; i++) {
-            e = read_message(d->fd, &m);        /* MENU_ITEM 0x4101 */
+            e = read_message(&d->sock, &m);        /* MENU_ITEM 0x4101 */
             if (e != DJL_OK) { d->dead = 1; return e; }
             if (m.type == 0x4101 && cb) cb(&m, ud);
             msg_free(&m);
         }
 
-        e = read_message(d->fd, &m);           /* MENU_FOOTER 0x4201 */
+        e = read_message(&d->sock, &m);           /* MENU_FOOTER 0x4201 */
         if (e != DJL_OK) { d->dead = 1; return e; }
         msg_free(&m);
 
@@ -754,8 +701,10 @@ djl_err djl_db_beat_grid(djl_db *d, djl_slot slot, djl_track_type type,
             uint32_t base = 20 + i * 16;   /* little-endian, unusually for this protocol */
             out->entries[i].beat_within_bar = (uint16_t)(g[base] | (g[base+1]<<8));
             out->entries[i].tempo_x100      = (uint16_t)(g[base+2] | (g[base+3]<<8));
-            out->entries[i].time_ms         = (uint32_t)(g[base+4] | (g[base+5]<<8) |
-                                              ((uint32_t)g[base+6]<<16) | ((uint32_t)g[base+7]<<24));
+            out->entries[i].time_ms         = (uint32_t)g[base+4] |
+                                              ((uint32_t)g[base+5] << 8) |
+                                              ((uint32_t)g[base+6] << 16) |
+                                              ((uint32_t)g[base+7] << 24);
         }
     }
     out->count = count;
@@ -791,7 +740,11 @@ void djl_blob_free(djl_blob *b)
 
 /* -------------------- cue list -------------------- */
 
-static uint32_t le32(const uint8_t *p) { return p[0] | (p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24); }
+static uint32_t le32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
 static uint16_t le16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1]<<8)); }
 
 static void utf16le_to_utf8(const uint8_t *src, size_t bytes, char *out, size_t outsz)

@@ -12,6 +12,9 @@ add_compile_options(
   -Wall -Wextra -Wpedantic -Wshadow
   -Wstrict-prototypes -Wmissing-prototypes
   -Wpointer-arith -Wcast-align
+  # The full set ARCHITECTURE.md section 13 mandates. The whole tree is clean
+  # under these, so keep them on by default rather than in a side build.
+  -Wconversion -Wcast-qual -Wundef
 )
 
 find_package(Threads REQUIRED)
@@ -50,7 +53,14 @@ target_include_directories(djlink PUBLIC
   $<INSTALL_INTERFACE:include>
 )
 target_include_directories(djlink PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(djlink PUBLIC Threads::Threads m)
+# Platform libraries. Everything OS-specific is confined to src/osal.c; these
+# are just what that file needs to link. Windows builds require a pthreads
+# implementation (MinGW's winpthreads); only the socket layer differs.
+if(WIN32)
+  target_link_libraries(djlink PUBLIC Threads::Threads ws2_32 iphlpapi)
+else()
+  target_link_libraries(djlink PUBLIC Threads::Threads m)
+endif()
 set_target_properties(djlink PROPERTIES C_VISIBILITY_PRESET default)
 
 add_executable(djl-monitor tools/djl_monitor.c)

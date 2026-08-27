@@ -200,7 +200,8 @@ int main(int argc, char **argv)
             for (uint32_t i = 0; i < cl.count; i++) {
                 djl_cue_entry *c = &cl.entries[i];
                 printf("  %-6s %-8s %8u ms", c->is_loop ? "loop" : "cue",
-                       c->hot_cue ? (char[]){'A'+c->hot_cue-1,0} : "memory", c->start_ms);
+                       c->hot_cue ? (char[]){(char)('A' + c->hot_cue - 1), 0} : "memory",
+                       c->start_ms);
                 if (c->is_loop) printf(" -> %u ms", c->end_ms);
                 if (c->has_color) printf("  color #%02x%02x%02x", c->r, c->g, c->b);
                 if (c->comment[0]) printf("  \"%s\"", c->comment);
