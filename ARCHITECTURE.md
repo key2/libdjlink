@@ -409,6 +409,60 @@ portmapper plus `mount` v1 and `nfs` v2 servers.
   query can be flaky/unavailable (e.g. `PSSI` came back unavailable in our dbserver
   tests), whereas reading the `.EXT` file directly always yields the phrases.
 
+### 1.8.1 NFS/PDB/ANLZ — implemented and verified live (2026-08-27)
+
+The client is implemented (`src/nfs/`, `src/pdb/`, `src/anlz/`) and was run end to end
+against CDJ-3000X player 1, firmware 1.31. Ports discovered by portmap `GETPORT`:
+`mountd` v1 on **48353**, `nfs` v2 on **2049** — discover them, never hardcode.
+
+Measured behaviour worth keeping:
+
+- **`MNT "/C/"` in UTF-16LE succeeds**; the same bytes as ASCII return `EACCES` (13).
+  An ephemeral source port is sufficient. Directory-entry names come back UTF-16LE too,
+  so `READDIR` decoding must handle that (we sniff the second byte for NUL and fall back
+  to plain bytes).
+- `export.pdb` reads as exactly **212992 bytes**, and the collection parses to 40 tracks.
+  Track 33 resolves to "Calvin Harris - Outside …", 128.00 BPM, key Dm, 192 kbps,
+  analysis path `/PIONEER/USBANLZ/P012/0000973C/ANLZ0001.DAT`.
+- **`PSSI` is present in this export.** The `dbserver` `0x2c04` query reports it
+  unavailable while the `.EXT` file carries it: 13 phrases, `mood=high`, `end_beat=477`,
+  which is consistent with the 482-beat grid. So the phrase data was always there and the
+  earlier conclusion that the export lacked phrase analysis was wrong — the *transport*
+  was at fault, not the media. No rekordbox re-export is needed to exercise PSSI.
+- Cross-source agreement for track 33: title, key, tempo, duration, bit rate and both hot
+  cues (A `#ff0017`, B `#00c4ff`, comment "1.1Bars") match the `dbserver` path exactly.
+- `date_added` legitimately differs between sources. PDB `ofs_strings[10]` (date_added) is
+  `2026-08-26`; `ofs_strings[15]` (analyze_date) is `2026-08-27`; the `dbserver` metadata
+  menu item `0x002e` returns `2026-08-27`, i.e. it agrees with the *analyze* date, not the
+  added date. The PDB reader reports the field the format actually names.
+
+**ANLZ tag inventory observed** in one rekordbox 7 export (per file):
+
+| File | Tags present |
+|---|---|
+| `.DAT` | `PPTH` `PVBR` `PQTZ` `PWAV` `PWV2` `PCOB`×2 |
+| `.EXT` | `PPTH` `PWV3` `PCOB`×2 `PCO2`×2 `PQT2` `PWV5` `PWV4` `PSSI` |
+| `.2EX` | `PPTH` `PWV7` `PWV6` `PWVC` `PVDI` |
+
+Three of those are **not in crate-digger's published spec**, which documents thirteen tags
+and none of these:
+
+- **`PQT2`** (`.EXT`, `len_header=0x38`) — an extended beat grid. It is emphatically *not*
+  a `PQTZ` with a larger header: its 8-byte beat entries start at **+24** (the first is
+  `bib=1, tempo=12800, t=236`, matching `PQTZ`), a `u4` beat count sits at **+40**, and
+  from **+0x38** there is one `u16` per beat (964 bytes = 482 × 2 for a 482-beat track),
+  cycling in descending groups of four. Semantics unconfirmed, so we deliberately do not
+  parse it — `PQTZ` in the `.DAT` is authoritative and complete. Aliasing the two, which
+  is easy to do by accident, silently corrupts the grid.
+- **`PWVC`** (`.2EX`, `len_tag=0x14`) — 8-byte body, observed `63 98 47 40 24 1c 63 9f`.
+  Does not obviously match the "vocal config thresholds" reading; left undecoded.
+- **`PVDI`** (`.2EX`, `len_header=0x18`, `len_tag=0x1316`) — 4874-byte body of small
+  values (`0x14`–`0xa0`) in an apparently regular stride. Undocumented anywhere we can
+  find; left undecoded.
+
+Also note `PQTZ`'s FourCC is `0x5051545A`. Transposing the last two bytes yields a
+constant that never matches, and the failure mode is a silently absent beat grid.
+
 ### 1.9 Opus Quad / XDJ-AZ (rekordbox-Lighting persona)
 
 These units cannot be talked to as a CDJ. Instead we pose as **rekordbox**:
@@ -465,7 +519,7 @@ surfaced as `DJL_EV_UNKNOWN_PACKET`.
 
 | Kind | Dir | Len | Notes |
 |---|---|---|---|
-| `0x11` | rekordbox→CDJ | 296 | rekordbox announce; payload contains the **host computer name in UTF-16LE** (the "DESKTOP-…" shown when browsing rekordbox on a player). Pairs with the `0x10` hello. |
+| `0x11` | rekordbox→CDJ | 296 | rekordbox announce; payload contains the **host computer name in UTF-16BE** (the "DESKTOP-…" shown when browsing rekordbox on a player). Pairs with the `0x10` hello. |
 | `0x16` | rekordbox→CDJ | 48 | small periodic control/keepalive to each player (mostly zero payload) |
 | `0x30` | mixer→rekordbox | 36 | DJM-A9 → rekordbox notification |
 | `0x31` | rekordbox→mixer | 44 | rekordbox → DJM-A9 (paired with `0x30`) |
@@ -473,10 +527,44 @@ surfaced as `DJL_EV_UNKNOWN_PACKET`.
 | `0x47` | rekordbox→CDJ | 72 | request/config; payload carries the `12 34 56 78` settings marker + an `01`-run — looks like a settings/capability exchange |
 | `0x80` | CDJ→rekordbox | 44 | player → rekordbox notification, references rekordbox's device number `0x11` |
 
+**Decoded (implemented in `djl_decode_rb_link`).** All seven use the ordinary port-50002
+framing already documented in §1.4 — there is no new envelope to learn:
+
+```
+0x0a  kind
+0x0b  device name, 20 bytes ASCII
+0x1f  0x01                       constant
+0x20  subtype: 0x00 player->rekordbox, 0x01 rekordbox->player, 0x03 either mixer direction
+0x21  sender's device number     (rekordbox is 0x11, DJM mixers 0x21)
+0x22  payload length, u16 BE, covering everything after the 0x24-byte header
+0x24  payload
+```
+
+Verified against every one of the 77 such packets in the capture: `0x24 + len_r` equals the
+datagram length for all kinds **except `0x16`**, which declares zero yet carries twelve
+zero bytes. The decoder therefore reports `length_consistent` rather than trusting the
+field, and bounds all copies by the bytes that actually arrived.
+
+Per-kind payload detail:
+
+| Kind | Payload |
+|---|---|
+| `0x11` | `dev`, `0x01`, two zero bytes, then the host name as **UTF-16BE** from `+4` |
+| `0x47` | `dev`, `0x04`, two zero bytes, `12 34 56 78`, `00 00 00 01`, then nine `0x01` bytes |
+| `0x46` | `dev`, `0x04`, then a `u16` BE code (`0x00a0` observed) |
+| `0x80` | `0x00`, `0x01`, then the referenced device number (`0x11`, rekordbox) |
+| `0x31` | `0x06` then seven zero bytes |
+| `0x10`, `0x30` | empty |
+
+**Correction to the first pass over this capture:** the `0x11` host name is UTF-16
+**big**-endian, not little-endian. It decodes to `DESKTOP-3AOPKV2` as BE and to CJK
+gibberish as LE. This matters because the same wire carries UTF-16**LE** for NFS paths and
+file names (§1.8), so the byte order genuinely differs by subsystem and cannot be inferred
+from context.
+
 **Consequences for the library:**
-- To *observe* a rekordbox-linked network fully, classify these seven kinds
-  (currently `UNKNOWN`) and decode at least `0x11` (source name) and the
-  `0x46/0x47` pair.
+- Observing a rekordbox-linked network is now covered: the seven kinds are classified and
+  surfaced as `DJL_EV_REKORDBOX_LINK` instead of `DJL_EV_UNKNOWN_PACKET`.
 - To *act as rekordbox* (serve a collection to players), the library would need
   an **NFS + mount + portmap server** with UTF-16LE filename handling and the
   above UDP control channel — a whole subsystem beyond the NFS *client* planned
@@ -883,10 +971,14 @@ typedef enum {
 djl_err djl_metadata_set_provider_order(djl_context*, const djl_provider_kind*, size_t);
 ```
 
-The default order is `NFS, DBSERVER, ARCHIVE, USER` — NFS first because it works
-regardless of device number and yields richer data (full collection, all ANLZ tags),
-falling back to `dbserver` for streaming tracks and CD audio, which do not exist on disk.
-For Opus Quad / XDJ-AZ, `OPUS` is forced first.
+**As implemented:** `djl_metadata_set_provider_order` takes `DJL_PROVIDER_NFS` and
+`DJL_PROVIDER_DBSERVER`, defaulting to NFS then dbserver. NFS goes first because it works
+regardless of device number and yields richer data (full collection, all ANLZ tags,
+reliable `PSSI`), falling back to `dbserver` for streaming tracks and CD audio, which do
+not exist on disk. The two *complement* rather than merely fall back: whichever runs
+second fills only the gaps the first left, and the chain stops early once metadata, grid
+and cues are all in hand. Because NFS needs no device number, auto-fetch is no longer
+gated on holding one of the four dbserver-capable slots.
 
 A **passive mode** flag suppresses all outbound queries (for read-only sniffing) — the
 library then only fills caches from packets it happens to observe.
@@ -1244,6 +1336,47 @@ which is exactly the kind of question the golden captures answer.
 - Semantic versioning with a hard rule: the wire codec is versioned independently and
   additively, because new hardware will add fields and must not break existing consumers.
 
+### 13.1 Portability status (measured)
+
+Every syscall lives in `src/osal.c`; no other translation unit includes a system header
+beyond the C standard library and `pthread.h`. Bringing up a platform is therefore a
+single-file job.
+
+| Target | State |
+|---|---|
+| Linux (glibc) | primary; all tests, ASan/UBSan, and live-rig verification |
+| Windows x86-64 | cross-built with mingw-w64; **all tests pass and both socket paths drive the live rig under Wine**. Needs winpthreads |
+| macOS / FreeBSD | `AF_LINK`/`sockaddr_dl`, `SO_NOSIGPIPE`, no `SO_BINDTODEVICE`; written to the documented API but **not compiled** (no SDK available here) |
+
+Socket handles are carried as `intptr_t`, because a Windows `SOCKET` is a `UINT_PTR` that
+does not fit in an `int` on 64-bit while `INVALID_SOCKET` still round-trips to `-1`.
+
+### 13.2 NuttX (scoping only — not started)
+
+NuttX is a realistic target for the core, but not for the whole library as it stands:
+
+- **Fits already.** `wire.c`, `templates.c`, `position.c`, `signature.c`, `pdb.c` and
+  `anlz.c` are pure C11 with no syscalls, no globals and (apart from the parsers' output
+  buffers) no allocation. `DJL_WITH_NFS=OFF` already builds and passes 765 checks, which is
+  exactly the configuration a microcontroller would want.
+- **Needs work.** Three things assume a hosted POSIX environment:
+  1. **Threads.** `context.c` and `metadata.c` use `pthread_t`, `pthread_mutex_t` and
+     `pthread_cond_t` directly, including `pthread_cond_timedwait`. NuttX does provide
+     pthreads, so this may just work, but the mutex/cond/thread trio should be abstracted
+     the way sockets now are before claiming support.
+  2. **Interface enumeration.** `getifaddrs` is not universally available; NuttX would use
+     `SIOCGIFADDR`/`SIOCGIFHWADDR` ioctls, which the Linux branch already contains as a
+     fallback and could be split out.
+  3. **Memory.** The event ring is 512 entries of a fairly wide union, and the metadata
+     cache is 64 heap-allocated entries. Both want compile-time bounds
+     (`DJL_EVQ_SIZE`, a smaller player ceiling) for a target with tens of KB of RAM.
+- **Would not fit.** Whole-file NFS downloads buffer an entire `.EXT`/`.2EX` in RAM
+  (110 KB each on the test USB, and audio files are far larger). A streaming, chunk-at-a-
+  time ANLZ parser would be required, which is a genuine redesign of `anlz.c`, not a port.
+
+Recommended first step if this is wanted: a `djl_thread.h` abstraction mirroring the OSAL
+split, then a `DJL_PROFILE_EMBEDDED` build that fixes the queue and cache sizes.
+
 ---
 
 ## 14. Coverage matrix and known gaps
@@ -1266,16 +1399,16 @@ live CDJ-3000X / DJM-A9 rig; **[built]** implemented, not yet hardware-verified;
 | `dbserver`: greeting, setup, metadata, folder browse, render/paging | **[done]** verified on CDJ-3000X | complete |
 | `dbserver`: search, remaining menu types, cue/beat-grid messages | **[built]**/**[todo]** transport done | complete |
 | Waveforms: blue preview + detail | **[done]** verified (CDJ-3000X self-analyzes unanalyzed media) | complete |
-| Waveforms: RGB, 3-band (ANLZ tags) | **[built]** framing fixed (was off-by-16); needs rekordbox USB to verify | complete |
+| Waveforms: RGB, 3-band (ANLZ tags) | **[done]** verified via NFS on a rekordbox USB: 1200-segment 3-band preview, 33867-segment detail | complete |
 | Cues: nexus and extended, colors (rekordbox LUT), comments, hot cues A–H | **[done]** built | complete |
 | Beat grids (dbserver) | **[done]** verified on CDJ-3000X | complete |
-| Song structure (`PSSI`) phrases + deobfuscation | **[done]** dbserver fetch+parse, unit-tested | complete |
-| Vocal config (`PWVC`) | **[todo]** | complete |
-| NFS + `export.pdb` + ANLZ | **[todo]** step 9 — **UNBLOCKED**: UTF-16LE mount verified live (was our ASCII bug, not a firmware lockdown) | complete |
+| Song structure (`PSSI`) phrases + deobfuscation | **[done]** **verified live over NFS** (13 phrases, mood=high, XOR mask exercised); dbserver `0x2c04` reports it unavailable for the same track | complete |
+| Vocal config (`PWVC`) | **[todo]** observed live (8-byte body) but the published field reading does not match; see §1.8.1 | **doc disagrees with hardware** |
+| NFS + `export.pdb` + ANLZ | **[done]** full client: portmap/mount/NFSv2, DeviceSQL reader with cross-table names, PMAI walker. Verified live: mount `/C/`, 212992-byte `export.pdb`, 40 tracks, track 33 grid+cues+phrases+waveforms | complete |
 | Device Library Plus (`exportLibrary.db`) | parse if a key is supplied | **encrypted; key not public** |
 | Opus Quad / XDJ-AZ via rekordbox-Lighting + PSSI matching | **[todo]** step 10 | mostly complete |
 | rekordbox EXPORT NFS *server* (CDJs mount us) + UTF-16LE names | **[todo]** whole subsystem, see §1.11 | observed 2026-08-27 |
-| rekordbox link UDP control (`0x11`,`0x16`,`0x30`,`0x31`,`0x46`,`0x47`,`0x80`) | **[todo]** surfaced as unknown; decode `0x11` name first | observed, undocumented |
+| rekordbox link UDP control (`0x11`,`0x16`,`0x30`,`0x31`,`0x46`,`0x47`,`0x80`) | **[done]** all seven classified and decoded (subtype/device/len_r + per-kind payloads, host name UTF-16**BE**); 77/77 capture packets decode | measured first-hand, §1.11 |
 | Touch Audio (`0x1e`/`0x1f`/`0x20`) | **[built]** timing rx decoded (122k pkts seen); PCM **[todo]** | complete |
 | Streaming tracks (Beatport LINK, Cloud Direct Play) | metadata + waveforms; no grid/cues | protocol-limited |
 | DJM-A9 mixer state (`0x39`) per-channel | expose decoded fields, raw block for the rest | master/FX block **undecoded** |
@@ -1285,6 +1418,9 @@ live CDJ-3000X / DJM-A9 rig; **[built]** implemented, not yet hardware-verified;
 | `0x3d` track metadata push (2572 B) | decode the ~150 B that is known, expose raw | **mostly undecoded** |
 | `0x56` 316-byte reply | expose raw | **likely AES-CBC, key unknown** |
 | CDJ → rekordbox unicast on 50000 | capture and expose raw | **not analyzed** |
+| Beat-grid position interpolation (pre-CDJ-3000) | **[done]** grid wired into the tracker; verified live — grid-derived beat matches the players' own status beat exactly on both decks | complete |
+| Portability: Linux / Windows / macOS | **[done]** Linux and Windows verified (mingw-w64 binaries pass all tests and drive the live rig under Wine); macOS written to the BSD API, uncompiled | n/a |
+| Undocumented ANLZ tags `PQT2` / `PWVC` / `PVDI` | **[todo]** left unparsed on purpose; `PQT2` partially mapped in §1.8.1 | **absent from crate-digger** |
 
 **Explicit design consequence of that last column:** the library must expose a
 `DJL_EV_UNKNOWN_PACKET` event carrying `(port, kind, subtype, length, bytes)` and a raw
@@ -1310,8 +1446,10 @@ get closed — the same way `dysentery` closed the ones we already have.
    media query.
 7. **`dbserver` client.** Metadata, art, grids, cues, waveforms, menus, search.
 8. **Position tracker + signature.** Everything a lighting or video cue engine needs.
-9. **NFS + PDB + ANLZ.** Four-player operation and complete-collection access.
-10. **Opus Quad / XDJ-AZ.** rekordbox-Lighting persona and PSSI matching.
+9. **NFS + PDB + ANLZ.** Four-player operation and complete-collection access. *Done and
+   hardware-verified; the metadata manager prefers it over `dbserver` by default.*
+10. **Opus Quad / XDJ-AZ.** rekordbox-Lighting persona and PSSI matching. *Blocked on
+    hardware: needs an Opus Quad or XDJ-AZ to observe.*
 11. **Touch Audio.**
 12. **Raw-research surface.** `DJL_EV_UNKNOWN_PACKET`, A9/Stagehand raw blocks, a
      `djl-dissect` tool in the spirit of `dysentery`'s packet window.

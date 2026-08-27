@@ -7,10 +7,11 @@ Protocol specification and design rationale: [`../ARCHITECTURE.md`](../ARCHITECT
 
 ## Status
 
-Implements steps 1–6 of the roadmap in `ARCHITECTURE.md`: the wire codec, device
-presence and number negotiation, status/beat ingest, status emission, and the
-mixer/media control surface. Metadata retrieval (`dbserver`, NFS, PDB/ANLZ) is
-the next phase and is not yet implemented.
+Implements steps 1–9 of the roadmap in `ARCHITECTURE.md`: the wire codec, device
+presence and number negotiation, status/beat ingest, status emission, the
+mixer/media control surface, the `dbserver` client, the position tracker, and the
+NFS + DeviceSQL + ANLZ metadata path. What remains is the Opus Quad / XDJ-AZ
+persona (needs that hardware), Touch Audio PCM, and acting *as* rekordbox.
 
 Verified against live hardware: 2 × `CDJ-3000X` (firmware 1.31) + `DJM-A9`.
 
@@ -27,15 +28,20 @@ Verified against live hardware: 2 × `CDJ-3000X` (firmware 1.31) + `DJM-A9`.
 | **dbserver: folder browse, metadata, waveform** | **done, verified** |
 | **dbserver: beat grid, cue list, album art** | **done** (grid verified) |
 | **Cue colors (rekordbox LUT), full metadata (label/year/bitrate/orig-artist/remixer)** | **done** (bitrate verified live) |
-| **Song structure / phrases (PSSI) + deobfuscation** | **done** (unit-tested; live needs rekordbox USB) |
-| **RGB / 3-band waveform framing fix** | **done** (needs rekordbox USB to verify) |
+| **Song structure / phrases (PSSI) + deobfuscation** | **done, verified live over NFS** (13 phrases; dbserver reports the same tag unavailable) |
+| **RGB / 3-band waveforms** | **done, verified** (1200-segment 3-band preview, 33867-segment detail) |
 | **Playback position interpolation** (`djl_get_position`, events) | **done, verified** |
 | **Track signature** (SHA-1) | **done** (KAT-tested) |
 | **Auto-fetch metadata on load** (worker + cache + events) | **done, verified** |
+| **NFS client (portmap / mount / NFSv2, UTF-16LE)** | **done, verified** on CDJ-3000X USB |
+| **DeviceSQL `export.pdb` reader** | **done, verified** (40-track collection, cross-table names) |
+| **ANLZ `.DAT`/`.EXT`/`.2EX` walker** | **done, verified** (grid, cues, phrases, waveforms) |
+| **Beat-grid position interpolation** (pre-CDJ-3000 players) | **done, verified** (matches players' own beat numbers) |
+| **rekordbox LINK control channel** (7 undocumented 50002 kinds) | **done** (77/77 captured packets decode) |
+| **Windows / macOS portability** | **Windows verified** under Wine incl. live rig; macOS written, uncompiled |
 | Tempo-master handoff dance, beat emission | partial |
-| dbserver cues, beat grids | not yet (client done) |
-| NFS + `export.pdb` + ANLZ parsing | not yet |
-| Opus Quad / XDJ-AZ, Touch Audio PCM | not yet |
+| Opus Quad / XDJ-AZ, Touch Audio PCM | not yet (Opus needs the hardware) |
+| Acting *as* rekordbox (NFS server + control channel) | not yet |
 
 ## Build
 
@@ -45,7 +51,11 @@ cmake --build build -j
 ctest --test-dir build
 ```
 
-No dependencies beyond libc, pthreads and libm.
+No dependencies beyond libc, pthreads and libm. The NFS client is on by default and
+can be compiled out with `-DDJL_WITH_NFS=OFF`, which leaves a core that needs no
+sockets beyond the four DJ Link ports (useful for embedded targets).
+
+Cross-compiling for Windows works with mingw-w64; link `ws2_32` and `iphlpapi`.
 
 ## Monitor tool
 
@@ -58,6 +68,22 @@ No dependencies beyond libc, pthreads and libm.
 
 # query every media slot on every player
 ./build/djl-monitor -i eth0 -n 3 -M
+```
+
+## NFS tool — read a player's USB/SD directly
+
+Needs no device number and no `dbserver`, so it works even with four real players
+occupying 1–4.
+
+```sh
+# list the collection straight out of export.pdb
+./build/djl-nfs -i eth0 -p 1 -s 3 -l
+
+# one track, fully: metadata + beat grid + cues + phrases + waveforms
+./build/djl-nfs -i eth0 -p 1 -s 3 -t 33
+
+# skip discovery and talk straight to an address; browse the media
+./build/djl-nfs -a 169.254.7.185 -s 3 -d PIONEER/rekordbox
 
 # hexdump the first CDJ status packet seen on port 50002
 ./build/djl-monitor -i eth0 -n 3 -X 0a -P 50002 -C 1
@@ -147,7 +173,14 @@ made.
 - pitch/BPM/half-frame arithmetic against the values in the specification
 - progressive truncation of every real packet — no length may decode "successfully"
 - bounds and width rejection on every primitive accessor
-- 20 000-iteration fuzz across all decoders
+- XDR round-trip and bounds, UTF-16LE encoding including surrogate pairs, and RPC
+  call/reply framing against denied, program-mismatch and truncated replies
+- ANLZ beat-grid, cue and waveform fixtures, including sections whose declared
+  lengths lie, plus a synthetic DeviceSQL page with a deleted row
+- real captured rekordbox LINK packets as golden vectors for all seven kinds
+- beat-grid position tracking: anchoring, jump correction, out-of-order beat
+  packets, and the stopped-at-track-end regression
+- 50 000 fuzz iterations across all decoders and both file parsers
 
 Run under sanitizers:
 
@@ -156,7 +189,10 @@ cmake -S . -B build-asan -DCMAKE_C_FLAGS="-fsanitize=address,undefined -g"
 cmake --build build-asan -j && ./build-asan/test_wire
 ```
 
-Clean under ASan+UBSan, including 1170 live packets processed from real hardware.
+Clean under ASan+UBSan, including live NFS transfers and 1170 live packets from real
+hardware. The suite runs in four configurations: Linux release (851 checks), Linux
+ASan/UBSan (851), core with `DJL_WITH_NFS=OFF` (765), and Windows via mingw-w64 (851,
+executed under Wine).
 
 ## License
 
