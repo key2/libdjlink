@@ -63,7 +63,7 @@ add_executable(djl-nfs tools/djl_nfs.c)
 target_link_libraries(djl-nfs PRIVATE djlink)
 
 enable_testing()
-add_executable(test_wire tests/test_wire.c tests/test_nfs.c tests/test_position.c)
+add_executable(test_wire tests/test_wire.c tests/test_nfs.c tests/test_position.c tests/test_rblink.c)
 target_include_directories(test_wire PRIVATE tests ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(test_wire PRIVATE djlink)
 add_test(NAME wire COMMAND test_wire)

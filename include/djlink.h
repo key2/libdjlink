@@ -104,6 +104,17 @@ typedef enum {
     DJL_PKT_AUDIO_DATA,
     DJL_PKT_AUDIO_HANDOVER,
     DJL_PKT_AUDIO_TIMING,
+    /* rekordbox LINK control channel, port 50002. Undocumented publicly;
+     * measured first-hand from a capture taken on the rekordbox host.
+     * Appended here rather than grouped above so existing enum values, which
+     * consumers may already have compiled against, keep their numbers. */
+    DJL_PKT_RB_ANNOUNCE,         /* 0x11 rekordbox -> player, carries host name */
+    DJL_PKT_RB_KEEPALIVE,        /* 0x16 rekordbox -> player, periodic */
+    DJL_PKT_RB_MIXER_NOTIFY,     /* 0x30 mixer -> rekordbox */
+    DJL_PKT_RB_MIXER_REPLY,      /* 0x31 rekordbox -> mixer */
+    DJL_PKT_RB_PLAYER_REPLY,     /* 0x46 player -> rekordbox, answers 0x47 */
+    DJL_PKT_RB_CONFIG,           /* 0x47 rekordbox -> player, settings block */
+    DJL_PKT_RB_PLAYER_NOTIFY,    /* 0x80 player -> rekordbox */
     DJL_PKT__COUNT
 } djl_packet_kind;
 
@@ -344,6 +355,45 @@ DJL_API djl_err djl_decode_media_details(const uint8_t *buf, size_t len,
                                          djl_media_details *out);
 
 /* ------------------------------------------------------------------ */
+/* rekordbox LINK control channel (port 50002)                         */
+/* ------------------------------------------------------------------ */
+
+/* When the collection source is rekordbox rather than another player's USB,
+ * players do not use the dbserver TCP protocol at all: metadata and files come
+ * over NFS (with rekordbox as the *server*) plus this UDP control channel.
+ * None of it is publicly documented; the field map below was measured from a
+ * capture taken on the rekordbox host (see ARCHITECTURE.md section 1.11).
+ *
+ * All seven kinds share the ordinary port-50002 framing: name at 0x0b, then
+ * 0x01 at 0x1f, a subtype at 0x20, the sender's device number at 0x21, and a
+ * big-endian payload length at 0x22 covering everything after the 0x24-byte
+ * header. */
+typedef struct {
+    uint8_t  kind;             /* raw kind byte at 0x0a */
+    char     name[DJL_NAME_LEN + 1];
+    uint8_t  subtype;          /* 0x20: 0 player->rekordbox, 1 rekordbox->player, 3 mixer */
+    uint8_t  device;           /* 0x21: sender's device number (rekordbox is 0x11) */
+    uint16_t payload_len;      /* 0x22, big-endian */
+    bool     length_consistent;/* payload_len agrees with the datagram size */
+
+    /* 0x11: the host computer name shown when browsing rekordbox on a player.
+     * Stored UTF-16 *big*-endian, unlike the UTF-16LE that NFS paths use. */
+    char     host_name[130];
+
+    /* 0x80: the device number this notification refers to (rekordbox's). */
+    uint8_t  referenced_device;
+    /* 0x47: true when the 12 34 56 78 settings marker is present. */
+    bool     has_settings_marker;
+    /* 0x46: the 16-bit code the player answers with. */
+    uint16_t reply_code;
+
+    uint16_t payload_copied;   /* bytes available in payload below */
+    uint8_t  payload[64];      /* start of the payload, for research */
+} djl_rb_link;
+
+DJL_API djl_err djl_decode_rb_link(const uint8_t *buf, size_t len, djl_rb_link *out);
+
+/* ------------------------------------------------------------------ */
 /* Context                                                             */
 /* ------------------------------------------------------------------ */
 
@@ -468,6 +518,7 @@ typedef enum {
     DJL_EV_SIGNATURE,
     DJL_EV_SONG_STRUCTURE,
     DJL_EV_UNKNOWN_PACKET,
+    DJL_EV_REKORDBOX_LINK,
     DJL_EV__COUNT
 } djl_event_kind;
 
@@ -516,6 +567,7 @@ typedef struct {
             uint16_t length;
             uint8_t  bytes[64];   /* first 64 bytes for research */
         } unknown;
+        djl_rb_link rb_link;
     } u;
 } djl_event;
 

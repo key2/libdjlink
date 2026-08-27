@@ -78,6 +78,14 @@ djl_packet_kind djl_wire_classify(uint16_t port, const uint8_t *buf, size_t len)
         case 0x55: return DJL_PKT_OPUS_DATA_REQ;
         case 0x56: return DJL_PKT_OPUS_DATA_RESP;
         case 0x58: return DJL_PKT_VU_STREAM;
+        /* rekordbox LINK control channel (measured, see ARCHITECTURE.md 1.11) */
+        case 0x11: return DJL_PKT_RB_ANNOUNCE;
+        case 0x16: return DJL_PKT_RB_KEEPALIVE;
+        case 0x30: return DJL_PKT_RB_MIXER_NOTIFY;
+        case 0x31: return DJL_PKT_RB_MIXER_REPLY;
+        case 0x46: return DJL_PKT_RB_PLAYER_REPLY;
+        case 0x47: return DJL_PKT_RB_CONFIG;
+        case 0x80: return DJL_PKT_RB_PLAYER_NOTIFY;
         default:   return DJL_PKT_UNKNOWN;
         }
     case DJL_PORT_AUDIO:
@@ -128,6 +136,13 @@ const char *djl_packet_kind_name(djl_packet_kind k)
     case DJL_PKT_AUDIO_DATA:         return "AudioData";
     case DJL_PKT_AUDIO_HANDOVER:     return "AudioHandover";
     case DJL_PKT_AUDIO_TIMING:       return "AudioTiming";
+    case DJL_PKT_RB_ANNOUNCE:        return "RekordboxAnnounce";
+    case DJL_PKT_RB_KEEPALIVE:       return "RekordboxKeepAlive";
+    case DJL_PKT_RB_MIXER_NOTIFY:    return "RekordboxMixerNotify";
+    case DJL_PKT_RB_MIXER_REPLY:     return "RekordboxMixerReply";
+    case DJL_PKT_RB_PLAYER_REPLY:    return "RekordboxPlayerReply";
+    case DJL_PKT_RB_CONFIG:          return "RekordboxConfig";
+    case DJL_PKT_RB_PLAYER_NOTIFY:   return "RekordboxPlayerNotify";
     default:                         return "Unknown";
     }
 }
@@ -462,6 +477,87 @@ djl_err djl_decode_media_details(const uint8_t *buf, size_t len, djl_media_detai
     return DJL_OK;
 }
 
+/* ---------------- rekordbox LINK control channel ---------------- */
+
+/* Measured on 2026-08-27 from a capture taken on the rekordbox host, where its
+ * own unicast is visible. rekordbox was device 0x11, with two CDJ-3000X players
+ * and a DJM-A9. Verified across all seven kinds:
+ *
+ *   kind  len  subtype  device  len_r  0x24+len_r == datagram
+ *   0x10   36   0x00     0x01      0   yes    player -> rekordbox hello
+ *   0x11  296   0x01     0x11    260   yes    rekordbox announce + host name
+ *   0x16   48    0x01    0x11      0   NO     12 trailing zero bytes
+ *   0x30   36   0x03     0x21      0   yes    mixer -> rekordbox
+ *   0x31   44   0x03     0x11      8   yes    rekordbox -> mixer
+ *   0x46   40   0x00     0x02      4   yes    player -> rekordbox reply
+ *   0x47   72   0x01     0x11     36   yes    rekordbox config, 12 34 56 78
+ *   0x80   44   0x00     0x01      8   yes    player -> rekordbox notify
+ *
+ * The one inconsistency is 0x16, which declares a zero-length payload yet
+ * carries twelve zero bytes, so length_consistent is reported rather than
+ * assumed. */
+#define RB_HDR 0x24
+
+djl_err djl_decode_rb_link(const uint8_t *buf, size_t len, djl_rb_link *out)
+{
+    if (!buf || !out) return DJL_ERR_INVAL;
+    memset(out, 0, sizeof *out);
+    if (!djl_wire_has_magic(buf, len)) return DJL_ERR_UNKNOWN;
+    if (len < RB_HDR) return DJL_ERR_SHORT;
+
+    switch (buf[0x0a]) {
+    case 0x10: case 0x11: case 0x16: case 0x30:
+    case 0x31: case 0x46: case 0x47: case 0x80:
+        break;
+    default:
+        return DJL_ERR_UNKNOWN;
+    }
+    out->kind = buf[0x0a];
+
+    djl_err e = djl_wire_device_name(DJL_PORT_STATUS, buf, len, out->name, sizeof out->name);
+    if (e != DJL_OK) return e;
+
+    bool ok;
+    out->subtype     = buf[0x20];
+    out->device      = buf[0x21];
+    out->payload_len = (uint16_t)djl_wire_be(buf, len, 0x22, 2, &ok);
+    out->length_consistent = ((size_t)RB_HDR + out->payload_len == len);
+
+    /* Trust the datagram, not the declared length, when copying. */
+    size_t avail = len - RB_HDR;
+    size_t take  = avail < sizeof out->payload ? avail : sizeof out->payload;
+    if (take) memcpy(out->payload, buf + RB_HDR, take);
+    out->payload_copied = (uint16_t)take;
+
+    switch (out->kind) {
+    case 0x11:
+        /* Payload: device number, 0x01, two zero bytes, then the computer name
+         * as UTF-16BE -- big-endian like every other string in this protocol,
+         * even though NFS file names on the same wire are UTF-16LE. */
+        if (avail > 4)
+            utf16be_to_utf8(buf + RB_HDR + 4, avail - 4,
+                            out->host_name, sizeof out->host_name);
+        break;
+    case 0x47:
+        /* The same 12 34 56 78 marker that opens the settings block in a
+         * player's status packet. */
+        if (avail >= 8 && buf[RB_HDR + 4] == 0x12 && buf[RB_HDR + 5] == 0x34 &&
+            buf[RB_HDR + 6] == 0x56 && buf[RB_HDR + 7] == 0x78)
+            out->has_settings_marker = true;
+        break;
+    case 0x46:
+        if (avail >= 4)
+            out->reply_code = (uint16_t)djl_wire_be(buf, len, RB_HDR + 2, 2, &ok);
+        break;
+    case 0x80:
+        if (avail >= 3) out->referenced_device = buf[RB_HDR + 2];
+        break;
+    default:
+        break;
+    }
+    return DJL_OK;
+}
+
 /* ---------------- name tables ---------------- */
 
 const char *djl_strerror(djl_err e)
@@ -556,6 +652,7 @@ const char *djl_event_kind_name(djl_event_kind k)
     case DJL_EV_SIGNATURE:           return "Signature";
     case DJL_EV_SONG_STRUCTURE:      return "SongStructure";
     case DJL_EV_UNKNOWN_PACKET:      return "UnknownPacket";
+    case DJL_EV_REKORDBOX_LINK:      return "RekordboxLink";
     default:                         return "?";
     }
 }

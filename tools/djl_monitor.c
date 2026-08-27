@@ -234,6 +234,18 @@ static void handle(const djl_event *ev, djl_context *ctx)
         for (int i = 0; i < 20; i++) printf("%02x", ev->u.signature.sha1[i]);
         printf("\n");
         break;
+    case DJL_EV_REKORDBOX_LINK: {
+        const djl_rb_link *r = &ev->u.rb_link;
+        printf("rblnk 0x%02x %-13s dev=%-3u sub=%u len=%u%s",
+               r->kind, r->name, r->device, r->subtype, r->payload_len,
+               r->length_consistent ? "" : " (len mismatch)");
+        if (r->host_name[0])        printf(" host='%s'", r->host_name);
+        if (r->referenced_device)   printf(" ref=dev%u", r->referenced_device);
+        if (r->has_settings_marker) printf(" [settings]");
+        if (r->reply_code)          printf(" code=0x%04x", r->reply_code);
+        printf("\n");
+        break;
+    }
     case DJL_EV_POSITION:
         if (g_verbose) {
             const djl_position *p = &ev->u.position;

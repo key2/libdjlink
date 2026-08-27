@@ -19,6 +19,8 @@ int djl_test_checks = 0;
 void djl_test_nfs(void);
 /* Implemented in test_position.c: beat-grid position tracking. */
 void djl_test_position(void);
+/* Implemented in test_rblink.c: rekordbox LINK control channel. */
+void djl_test_rblink(void);
 
 #define CHECK(cond, ...) do {                            \
     checks++;                                            \
@@ -676,6 +678,7 @@ int main(void)
     test_fuzz_no_crash();
     djl_test_nfs();
     djl_test_position();
+    djl_test_rblink();
 
     printf("\n%d checks, %d failure(s)\n", checks, failures);
     return failures ? 1 : 0;

@@ -558,6 +558,27 @@ static void handle_status(djl_context *ctx, const uint8_t *buf, size_t len,
         djl_emit(ctx, &ev);
         return;
     }
+    case DJL_PKT_RB_ANNOUNCE:
+    case DJL_PKT_RB_KEEPALIVE:
+    case DJL_PKT_RB_MIXER_NOTIFY:
+    case DJL_PKT_RB_MIXER_REPLY:
+    case DJL_PKT_RB_PLAYER_REPLY:
+    case DJL_PKT_RB_CONFIG:
+    case DJL_PKT_RB_PLAYER_NOTIFY:
+    case DJL_PKT_RB_LIGHTING_HELLO: {
+        /* rekordbox LINK control traffic. We do not act on it yet, but a
+         * consumer watching a rekordbox-sourced network needs to see it. */
+        djl_rb_link rb;
+        if (djl_decode_rb_link(buf, len, &rb) != DJL_OK) return;
+        djl_event ev;
+        memset(&ev, 0, sizeof ev);
+        ev.kind    = DJL_EV_REKORDBOX_LINK;
+        ev.device  = rb.device;
+        ev.time_ms = now - ctx->t0;
+        ev.u.rb_link = rb;
+        djl_emit(ctx, &ev);
+        return;
+    }
     case DJL_PKT_UNKNOWN: {
         djl_event ev;
         memset(&ev, 0, sizeof ev);
