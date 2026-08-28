@@ -138,11 +138,11 @@ typedef struct {
     bool     from_precise;
     int64_t  track_length_ms;  /* -1 if unknown */
 
-    /* Beat-grid anchoring, for players with no precise-position stream.
-     * The grid itself lives in the metadata cache and is refreshed here by
-     * generation counter so position.c never has to own or free it. */
+    /* Beat-grid anchoring, for players with no precise-position stream. The
+     * grid is BORROWED from the metadata cache, never owned here: staleness is
+     * detected by pointer identity in djl_pos_attach_grid, and the pointer is
+     * cleared on track change, device loss and cache teardown. */
     const djl_beat_grid *grid;
-    uint32_t grid_gen;         /* bumped whenever the cached grid is replaced */
     bool     grid_beat_known;  /* last beat number came from a status packet */
 } djl_pos_state;
 
@@ -197,6 +197,24 @@ struct djl_context {
     djl_provider_kind providers[DJL_MAX_PROVIDERS];
     size_t          provider_count;
 
+    /* Bumped by the I/O thread whenever a player's media changes or the device
+     * disappears, so the metadata worker knows to drop any NFS mount and parsed
+     * export.pdb it cached for that player. Read/written under ctx->lock. */
+    uint32_t        media_gen[64];
+    uint32_t        media_sig[64];   /* fingerprint of the last media details */
+
+    /* NFS mounts cached across fetches, so a track load does not re-mount and
+     * re-download export.pdb every time. Touched ONLY by the metadata worker
+     * thread, which is why it needs no lock; djl_nfs itself is not thread-safe.
+     * Sized for the four player slots plus headroom. */
+    struct {
+        djl_nfs *h;
+        uint8_t  host;
+        uint8_t  slot;
+        uint32_t gen;        /* media_gen value this mount was opened at */
+        uint64_t last_use_ms;
+    } nfs_cache[6];
+
     /* our advertised state */
     bool            adv_playing, adv_master, adv_synced, adv_on_air;
     double          adv_tempo;
@@ -243,6 +261,19 @@ struct djl_meta_entry {
     bool has_ss;   djl_song_structure ss;
 };
 
+/* Wall-clock budget for one metadata job's NFS work. Without a cap, four RPC
+ * attempts at a doubling timeout (6 s) times the chunk-shrink retries times a
+ * handful of files let one unreachable player pin the worker for minutes and
+ * block djl_context_stop behind it. */
+#define DJL_NFS_JOB_BUDGET_MS 8000
+
+/* Close and forget every cached NFS mount (metadata.c). Worker thread only. */
+void    djl_nfs_cache_clear(djl_context *ctx);
+
+/* Refuse to start new NFS round trips after this monotonic timestamp. 0 clears
+ * the limit. Applies to the handle's subsequent calls. */
+void    djl_nfs_set_deadline(djl_nfs *n, uint64_t deadline_ms);
+
 /* Metadata manager (metadata.c). enqueue must be called with ctx->lock held. */
 djl_err djl_meta_start(djl_context *ctx);
 void    djl_meta_stop(djl_context *ctx);
@@ -251,5 +282,8 @@ void    djl_meta_enqueue(djl_context *ctx, uint8_t player, uint8_t host,
 /* Point a player's position tracker at its cached beat grid, or clear it when
  * the cache no longer holds one. Caller must hold ctx->lock. */
 void    djl_pos_attach_grid(djl_context *ctx, uint8_t player);
+/* Drop the borrowed grid, e.g. when the loaded track changes and the cached
+ * grid still describes the previous one. Caller must hold ctx->lock. */
+void    djl_pos_detach_grid(djl_context *ctx, uint8_t player);
 
 #endif /* DJL_INTERNAL_H */

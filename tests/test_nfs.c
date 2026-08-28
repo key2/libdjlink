@@ -335,6 +335,13 @@ static void test_anlz_cues(void)
     size_t end2 = put_section(file, end, "PCO2", 0x18, pco2, sizeof pco2);
     be32_at(file + 8, (uint32_t)end2);
 
+    /* Regression: PCOB occurs in BOTH .DAT and .EXT of one track and both are
+     * parsed into the same djl_anlz, so a second pass over the same section
+     * must not append the cues again. Without de-duplication an export with no
+     * PCO2 reported every cue twice. */
+    CHECK_EQ_U(djl_anlz_parse(file, end, &a), DJL_OK);
+    CHECK_EQ_U(a.cues.count, 1);
+
     CHECK_EQ_U(djl_anlz_parse(file, end2, &a), DJL_OK);
     CHECK(a.cues.extended, "PCO2 must supersede PCOB");
     CHECK_EQ_U(a.cues.count, 1);
@@ -385,6 +392,67 @@ static void test_anlz_waveforms(void)
     CHECK_EQ_U(a.rgb_detail.length, 16);
     CHECK_EQ_U(a.rgb_detail.style, DJL_WAVE_RGB);
     CHECK(a.rgb_detail.detail, "rgb_detail is a detail waveform");
+    djl_anlz_free(&a);
+}
+
+/* Regression: PWV3 (blue detail) is a sized "scroll" tag like PWV4/5/6/7, not a
+ * PWAV-style tag. Reading it as PWAV took len_entry_bytes (1) for the segment
+ * count and produced a single garbage byte instead of the waveform. */
+static void test_anlz_pwv3_is_sized(void)
+{
+    uint8_t file[2048];
+    memset(file, 0, sizeof file);
+    memcpy(file, "PMAI", 4);
+    be32_at(file + 4, 0x1c);
+
+    uint8_t pwv3[12 + 400];
+    memset(pwv3, 0, sizeof pwv3);
+    be32_at(pwv3, 1);            /* len_entry_bytes */
+    be32_at(pwv3 + 4, 400);      /* len_entries    */
+    for (int i = 0; i < 400; i++) pwv3[12 + i] = (uint8_t)(0x81 + (i % 30));
+    size_t end = put_section(file, 0x1c, "PWV3", 0x18, pwv3, sizeof pwv3);
+    be32_at(file + 8, (uint32_t)end);
+
+    djl_anlz a;
+    memset(&a, 0, sizeof a);
+    CHECK_EQ_U(djl_anlz_parse(file, end, &a), DJL_OK);
+    CHECK(a.has_detail, "PWV3 must yield a detail waveform");
+    CHECK_EQ_U(a.detail.length, 400);
+    CHECK_EQ_U(djl_waveform_segment_count(&a.detail), 400);
+    CHECK_EQ_U(a.detail.style, DJL_WAVE_BLUE);
+    djl_anlz_free(&a);
+}
+
+/* A cue entry whose "status" word is zero must still be reported: live
+ * CDJ-3000X exports ship active hot cues that way, and beat-link emits every
+ * entry regardless, so filtering on it would drop real cues. */
+static void test_anlz_keeps_zero_status_cues(void)
+{
+    uint8_t file[1024];
+    memset(file, 0, sizeof file);
+    memcpy(file, "PMAI", 4);
+    be32_at(file + 4, 0x1c);
+
+    uint8_t pcob[12 + 0x38 * 2];
+    memset(pcob, 0, sizeof pcob);
+    be16_at(pcob + 6, 2);
+    for (int k = 0; k < 2; k++) {
+        uint8_t *e = pcob + 12 + k * 0x38;
+        memcpy(e, "PCPT", 4);
+        be32_at(e + 4, 0x1c);
+        be32_at(e + 8, 0x38);
+        be32_at(e + 0x0c, 0);                 /* memory point, no hot cue */
+        be32_at(e + 0x10, 0);                 /* "status" zero, as real files have */
+        e[0x1c] = 1;
+        be32_at(e + 0x20, (uint32_t)(2000 + k * 1000));
+    }
+    size_t end = put_section(file, 0x1c, "PCOB", 0x18, pcob, sizeof pcob);
+    be32_at(file + 8, (uint32_t)end);
+
+    djl_anlz a;
+    memset(&a, 0, sizeof a);
+    CHECK_EQ_U(djl_anlz_parse(file, end, &a), DJL_OK);
+    CHECK_EQ_U(a.cues.count, 2);
     djl_anlz_free(&a);
 }
 
@@ -552,6 +620,76 @@ static void test_pdb_reader(void)
         djl_pdb_close(p);
     }
 
+    /* --- regression: row-index slot underflow (was a ~4 GB OOB read) ---
+     * With the smallest legal page size, group 14 puts base at 8, so slot i=2
+     * computes base - 6 - 4 and wraps to 0xfffffffe. A bounds check on the
+     * result also wraps (0xfffffffe + 2 == 0) and cannot fire, so the guard has
+     * to happen before the subtraction. Reproduced as a hard SIGSEGV. */
+    {
+        const uint32_t ps = 512;
+        uint8_t *m = calloc(1, 2 * ps);
+        CHECK(m != NULL, "underflow fixture allocation");
+        if (m) {
+            le32_at(m + 4, ps);
+            le32_at(m + 8, 1);
+            le32_at(m + 28 + 0, 0);
+            le32_at(m + 28 + 8, 1);
+            le32_at(m + 28 + 12, 1);
+            uint8_t *pg = m + ps;
+            le32_at(pg + 4, 1);
+            le32_at(pg + 8, 0);
+            le32_at(pg + 12, 1);
+            pg[27] = 0x24;
+            le32_at(pg + 24, 227);            /* 15 groups; last holds 3 slots */
+            pg[27] = 0x24;
+            le16_at(pg + 8 - 4, 0x0004);      /* present bit 2 -> the bad slot */
+            djl_pdb *q = NULL;
+            CHECK_EQ_U(djl_pdb_open(m, 2 * ps, &q), DJL_OK);
+            if (q) {
+                (void)djl_pdb_track_count(q);  /* must not read out of bounds */
+                djl_pdb_close(q);
+            }
+            free(m);
+        }
+    }
+
+    /* --- regression: cyclic page chain must not be re-walked ---
+     * A two-page cycle is not a self-link, so rejecting only next == idx let
+     * the walk run PDB_MAX_PAGES times, re-indexing every row on each pass
+     * (measured 1.6 M rowrefs from a 12 KB file). */
+    {
+        const uint32_t ps = 4096;
+        size_t mlen = 3 * ps;
+        uint8_t *m = calloc(1, mlen);
+        CHECK(m != NULL, "cycle fixture allocation");
+        if (m) {
+            le32_at(m + 4, ps);
+            le32_at(m + 8, 1);
+            le32_at(m + 28 + 0, 0);
+            le32_at(m + 28 + 8, 1);
+            le32_at(m + 28 + 12, 99);         /* last_page never reached */
+            for (int pgno = 1; pgno <= 2; pgno++) {
+                uint8_t *pg = m + (size_t)pgno * ps;
+                le32_at(pg + 4, (uint32_t)pgno);
+                le32_at(pg + 8, 0);
+                le32_at(pg + 12, pgno == 1 ? 2u : 1u);   /* 1 -> 2 -> 1 */
+                pg[27] = 0x24;
+                le32_at(pg + 24, 16);
+                pg[27] = 0x24;
+                le16_at(pg + ps - 4, 0xffff);
+                for (int i = 0; i < 16; i++) le16_at(pg + ps - 6 - i * 2, 0);
+            }
+            djl_pdb *q = NULL;
+            CHECK_EQ_U(djl_pdb_open(m, mlen, &q), DJL_OK);
+            if (q) {
+                /* 16 rows per page, two pages, each visited exactly once. */
+                CHECK_EQ_U(djl_pdb_track_count(q), 32);
+                djl_pdb_close(q);
+            }
+            free(m);
+        }
+    }
+
     /* Malformed headers must be refused rather than trusted. */
     p = NULL;
     CHECK_EQ_U(djl_pdb_open(buf, 8, &p), DJL_ERR_SHORT);
@@ -649,6 +787,8 @@ void djl_test_nfs(void)
     test_anlz_beat_grid();
     test_anlz_cues();
     test_anlz_waveforms();
+    test_anlz_pwv3_is_sized();
+    test_anlz_keeps_zero_status_cues();
     test_anlz_rejects_garbage();
     test_pdb_reader();
     test_fuzz_parsers();

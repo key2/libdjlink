@@ -353,6 +353,44 @@ static void test_stopped_at_track_end_does_not_drift(void)
           (long long)out.position_ms);
 }
 
+/* A player with no precise-position stream gets its track length from the grid,
+ * and that length must follow the grid when the track changes. Previously the
+ * derivation was guarded on "track_length_ms < 0", which a zero-initialised
+ * state never satisfies, so it was dead code. */
+static void test_track_length_from_grid(void)
+{
+    djl_beat_grid_entry short_st[16], long_st[GRID_BEATS];
+    djl_beat_grid short_grid = make_grid(short_st, 16);
+    djl_beat_grid long_grid  = make_grid(long_st, GRID_BEATS);
+
+    djl_pos_state ps;
+    memset(&ps, 0, sizeof ps);
+    ps.position_ms     = -1;
+    ps.track_length_ms = -1;
+    ps.grid            = &short_grid;
+
+    djl_cdj_status s = status_at(4, true, 128.0);
+    djl_pos_apply_status(&ps, &s, 1000);
+    djl_position out;
+    djl_pos_interpolate(&ps, 2, 1000, &out);
+    CHECK_EQ_I(out.track_length_ms, djl_grid_time_of_beat(&short_grid, 16));
+
+    /* Swapping in a longer track's grid must update the reported length. */
+    ps.grid = &long_grid;
+    djl_pos_apply_status(&ps, &s, 1200);
+    djl_pos_interpolate(&ps, 2, 1200, &out);
+    CHECK_EQ_I(out.track_length_ms, djl_grid_time_of_beat(&long_grid, GRID_BEATS));
+
+    /* With no grid at all the length must read as unknown, not as zero. */
+    djl_pos_state bare;
+    memset(&bare, 0, sizeof bare);
+    bare.position_ms     = -1;
+    bare.track_length_ms = -1;
+    djl_pos_apply_status(&bare, &s, 1000);
+    djl_pos_interpolate(&bare, 2, 1000, &out);
+    CHECK_EQ_I(out.track_length_ms, -1);
+}
+
 static void test_no_grid_still_works(void)
 {
     /* Without a grid we must degrade gracefully to the old behaviour rather
@@ -390,5 +428,6 @@ void djl_test_position(void)
     test_jump_correction();
     test_precise_position_wins();
     test_stopped_at_track_end_does_not_drift();
+    test_track_length_from_grid();
     test_no_grid_still_works();
 }

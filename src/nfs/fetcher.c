@@ -21,8 +21,7 @@
 #define MAX_FILE_BYTES  (64u * 1024u * 1024u)
 
 struct djl_nfs {
-    djl_rpc  rpc;
-    uint8_t  ip[4];
+    djl_rpc  rpc;              /* also holds the peer address */
     djl_slot slot;
     char     mount_path[8];      /* "/B/" or "/C/" */
     uint16_t mount_port, nfs_port;
@@ -30,12 +29,25 @@ struct djl_nfs {
     bool     mounted;
     bool     dot_pioneer;        /* HFS+ media hides it as ".PIONEER" */
     uint32_t chunk;
+    uint64_t deadline_ms;      /* 0 = no limit; see djl_nfs_set_deadline */
 
     djl_blob  pdb_raw;           /* cached export.pdb bytes */
     djl_pdb  *pdb;               /* parsed view over pdb_raw */
 };
 
 bool djl_nfs_supported(void) { return true; }
+
+void djl_nfs_set_deadline(djl_nfs *n, uint64_t deadline_ms)
+{
+    if (n) n->deadline_ms = deadline_ms;
+}
+
+/* True when the caller's time budget for this handle is spent. Checked before
+ * each round trip so a wedged player cannot hold the worker indefinitely. */
+static bool out_of_time(const struct djl_nfs *n)
+{
+    return n->deadline_ms != 0 && djl_now_ms() >= n->deadline_ms;
+}
 
 static const char *slot_mount_path(djl_slot slot)
 {
@@ -57,7 +69,6 @@ djl_err djl_nfs_open_addr(const uint8_t ip[4], djl_slot slot, djl_nfs **out)
 
     struct djl_nfs *n = calloc(1, sizeof *n);
     if (!n) return DJL_ERR_NOMEM;
-    memcpy(n->ip, ip, 4);
     n->slot  = slot;
     n->chunk = READ_CHUNK_MAX;
     snprintf(n->mount_path, sizeof n->mount_path, "%s", mpath);
@@ -73,7 +84,14 @@ djl_err djl_nfs_open_addr(const uint8_t ip[4], djl_slot slot, djl_nfs **out)
     if (e != DJL_OK) goto fail;
 
     e = djl_mount_mnt(&n->rpc, n->mount_port, n->mount_path, &n->root);
-    if (e != DJL_OK) goto fail;
+    if (e != DJL_OK) {
+        /* A lost reply may still have registered the mount on the player, so
+         * release it rather than leaving an entry behind for the rest of the
+         * show. Best effort: we already know the network is unhappy. */
+        if (e == DJL_ERR_TIMEOUT)
+            (void)djl_mount_umnt(&n->rpc, n->mount_port, n->mount_path);
+        goto fail;
+    }
     n->mounted = true;
 
     *out = n;
@@ -144,6 +162,7 @@ static djl_err resolve_path(struct djl_nfs *n, const char *path, djl_nfs_stat *o
         }
         elem[k] = '\0';
         if (k == 0 || strcmp(elem, ".") == 0) continue;
+        if (out_of_time(n)) return DJL_ERR_TIMEOUT;
 
         djl_err e = lookup_element(n, &cur, elem, out);
         if (e != DJL_OK) return e;
@@ -170,6 +189,7 @@ djl_err djl_nfs_read_file(djl_nfs *n, const char *path, djl_blob *out)
 
     uint32_t off = 0;
     while (off < st.size) {
+        if (out_of_time(n)) { free(buf); return DJL_ERR_TIMEOUT; }
         uint32_t want = st.size - off;
         if (want > n->chunk) want = n->chunk;
         size_t got = 0;
@@ -177,8 +197,10 @@ djl_err djl_nfs_read_file(djl_nfs *n, const char *path, djl_blob *out)
                           buf + off, st.size - off, &got);
         if (e != DJL_OK) {
             /* Some players are unhappy with 8 KB reads (IP fragmentation);
-             * shrink once and retry from the same offset before giving up. */
-            if (n->chunk > READ_CHUNK_MIN) {
+             * shrink and retry from the same offset. Only a timeout looks like
+             * a fragmentation problem -- retrying a hard error just multiplies
+             * the RPC budget for a file that is never going to arrive. */
+            if (e == DJL_ERR_TIMEOUT && n->chunk > READ_CHUNK_MIN) {
                 n->chunk /= 2;
                 continue;
             }

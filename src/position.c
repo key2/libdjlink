@@ -195,7 +195,12 @@ void djl_pos_apply_status(djl_pos_state *s, const djl_cdj_status *st, uint64_t n
         if (!s->beat_within_bar && bib) s->beat_within_bar = bib;
     }
 
-    if (s->track_length_ms < 0 && s->grid && s->grid->count)
+    /* Only precise-position packets carry a track length, so derive one from
+     * the grid for everyone else. Recomputed on every status rather than only
+     * when unknown, so a new track's grid immediately supersedes the old
+     * length (and because a zero-initialised state is never negative, a
+     * "< 0 means unknown" test here would simply never fire). */
+    if (!s->from_precise && s->grid && s->grid->count)
         s->track_length_ms = djl_grid_time_of_beat(s->grid, (int32_t)s->grid->count);
 }
 

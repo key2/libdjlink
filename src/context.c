@@ -181,10 +181,19 @@ static void roster_expire(djl_context *ctx, uint64_t now)
             ev.u.device_lost = e->info;
             djl_emit(ctx, &ev);
             if (ctx->tempo_master == e->info.number) ctx->tempo_master = 0;
-            /* Forget where a device that has gone away was playing. */
-            if (e->info.number < 64)
-                memset(&ctx->positions[e->info.number], 0,
-                       sizeof ctx->positions[e->info.number]);
+            /* Any NFS mount the worker holds for this device is now stale. */
+            if (e->info.number < 64) ctx->media_gen[e->info.number]++;
+            /* Forget where a device that has gone away was playing, but keep
+             * its beat-grid link: the cache entry it borrows is still valid,
+             * and a device that reappears on the same track never triggers a
+             * new fetch, so nothing would re-attach it. */
+            if (e->info.number < 64) {
+                djl_pos_state *ps = &ctx->positions[e->info.number];
+                const djl_beat_grid *keep_grid = ps->grid;
+                memset(ps, 0, sizeof *ps);
+                ps->grid            = keep_grid;
+                ps->track_length_ms = -1;
+            }
             memset(e, 0, sizeof *e);
         }
     }
@@ -459,6 +468,23 @@ static void note_master(djl_context *ctx, uint8_t number, bool is_master,
     }
 }
 
+/* Surface a datagram we could not interpret, so nothing on the wire becomes
+ * invisible to a consumer doing protocol research. */
+static void emit_unknown_packet(djl_context *ctx, uint16_t port,
+                                const uint8_t *buf, size_t len, uint64_t now)
+{
+    djl_event ev;
+    memset(&ev, 0, sizeof ev);
+    ev.kind    = DJL_EV_UNKNOWN_PACKET;
+    ev.time_ms = now - ctx->t0;
+    ev.u.unknown.port      = port;
+    int kb = djl_wire_kind_byte(buf, len);
+    ev.u.unknown.kind_byte = (uint8_t)(kb < 0 ? 0 : kb);
+    ev.u.unknown.length    = (uint16_t)len;
+    memcpy(ev.u.unknown.bytes, buf, len < 64 ? len : 64);
+    djl_emit(ctx, &ev);
+}
+
 static void handle_status(djl_context *ctx, const uint8_t *buf, size_t len,
                           uint64_t now)
 {
@@ -484,7 +510,17 @@ static void handle_status(djl_context *ctx, const uint8_t *buf, size_t len,
             e->info.last_seen_ms = now - ctx->t0;
         }
 
+        /* Work out whether the track changed BEFORE touching the position
+         * tracker. The cached beat grid still describes the previous track
+         * until a fetch completes, so anchoring the new track's beat numbers
+         * to it would report a confidently wrong playhead for the whole fetch
+         * window (seconds, over NFS). */
+        bool ref_changed = st.rekordbox_id != prev_id ||
+                           (uint8_t)st.track_slot != prev_slot ||
+                           (uint8_t)st.track_type != prev_type;
+
         if (st.number < 64) {
+            if (ref_changed && had_status) djl_pos_detach_grid(ctx, st.number);
             djl_pos_apply_status(&ctx->positions[st.number], &st, now);
             emit_position(ctx, st.number, now);
         }
@@ -502,9 +538,6 @@ static void handle_status(djl_context *ctx, const uint8_t *buf, size_t len,
          * CDJ-3000X firmware 1.31, where P1 goes to 0x11 and Dr/Sr/Tr/id all
          * drop to zero), so a transition to zero must not look like a load,
          * and a transition back must not re-fire for the same track. */
-        bool ref_changed = st.rekordbox_id != prev_id ||
-                           (uint8_t)st.track_slot != prev_slot ||
-                           (uint8_t)st.track_type != prev_type;
         if (had_status && ref_changed && st.rekordbox_id != 0 &&
             st.track_type != DJL_TRACK_NONE && st.track_slot != DJL_SLOT_NONE) {
             djl_event tl;
@@ -520,10 +553,13 @@ static void handle_status(djl_context *ctx, const uint8_t *buf, size_t len,
             djl_emit(ctx, &tl);
 
             /* Kick off an automatic metadata fetch from the hosting player.
-             * No device-number requirement here: the NFS provider works at any
-             * number (or none), and the dbserver provider checks the 1..6
-             * constraint itself. We only refuse to query ourselves. */
+             * No device-NUMBER requirement here: the NFS provider works at any
+             * number, and the dbserver provider checks the 1..6 constraint
+             * itself. We do require being fully online, so we never query a
+             * player before finishing our own number negotiation, and we refuse
+             * to query ourselves. */
             if (ctx->cfg.auto_metadata && !ctx->cfg.observe_only &&
+                ctx->state == DJL_ST_ONLINE &&
                 st.track_device != ctx->id.number)
                 djl_meta_enqueue(ctx, st.number, st.track_device,
                                  st.track_slot, st.track_type, st.rekordbox_id);
@@ -549,6 +585,20 @@ static void handle_status(djl_context *ctx, const uint8_t *buf, size_t len,
     case DJL_PKT_MEDIA_RESPONSE: {
         djl_media_details md;
         if (djl_decode_media_details(buf, len, &md) != DJL_OK) return;
+        /* Media details change when a stick is swapped, which invalidates both
+         * the cached mount and the export.pdb read through it. Track the
+         * (slot, track count, free space) triple: cheap and sufficient to
+         * notice a different volume. */
+        if (md.host_device < 64) {
+            uint32_t sig = (uint32_t)md.track_count ^
+                           ((uint32_t)md.playlist_count << 8) ^
+                           (uint32_t)(md.free_bytes >> 20) ^
+                           ((uint32_t)md.slot << 24);
+            if (ctx->media_sig[md.host_device] != sig) {
+                ctx->media_sig[md.host_device] = sig;
+                ctx->media_gen[md.host_device]++;
+            }
+        }
         djl_event ev;
         memset(&ev, 0, sizeof ev);
         ev.kind    = DJL_EV_MEDIA_DETAILS;
@@ -567,31 +617,29 @@ static void handle_status(djl_context *ctx, const uint8_t *buf, size_t len,
     case DJL_PKT_RB_PLAYER_NOTIFY:
     case DJL_PKT_RB_LIGHTING_HELLO: {
         /* rekordbox LINK control traffic. We do not act on it yet, but a
-         * consumer watching a rekordbox-sourced network needs to see it. */
+         * consumer watching a rekordbox-sourced network needs to see it.
+         * If it will not decode, fall through to DJL_EV_UNKNOWN_PACKET rather
+         * than dropping the datagram: these kinds used to surface there, and a
+         * research consumer must not silently lose them. */
         djl_rb_link rb;
-        if (djl_decode_rb_link(buf, len, &rb) != DJL_OK) return;
-        djl_event ev;
-        memset(&ev, 0, sizeof ev);
-        ev.kind    = DJL_EV_REKORDBOX_LINK;
-        ev.device  = rb.device;
-        ev.time_ms = now - ctx->t0;
-        ev.u.rb_link = rb;
-        djl_emit(ctx, &ev);
+        if (djl_decode_rb_link(buf, len, &rb) == DJL_OK) {
+            djl_event ev;
+            memset(&ev, 0, sizeof ev);
+            ev.kind    = DJL_EV_REKORDBOX_LINK;
+            ev.device  = rb.device;
+            ev.time_ms = now - ctx->t0;
+            ev.u.rb_link = rb;
+            djl_emit(ctx, &ev);
+            return;
+        }
+        /* Undecodable: report it as an unknown packet, which is where these
+         * kinds surfaced before they were classified. */
+        emit_unknown_packet(ctx, DJL_PORT_STATUS, buf, len, now);
         return;
     }
-    case DJL_PKT_UNKNOWN: {
-        djl_event ev;
-        memset(&ev, 0, sizeof ev);
-        ev.kind    = DJL_EV_UNKNOWN_PACKET;
-        ev.time_ms = now - ctx->t0;
-        ev.u.unknown.port      = DJL_PORT_STATUS;
-        int kb = djl_wire_kind_byte(buf, len);
-        ev.u.unknown.kind_byte = (uint8_t)(kb < 0 ? 0 : kb);
-        ev.u.unknown.length    = (uint16_t)len;
-        memcpy(ev.u.unknown.bytes, buf, len < 64 ? len : 64);
-        djl_emit(ctx, &ev);
+    case DJL_PKT_UNKNOWN:
+        emit_unknown_packet(ctx, DJL_PORT_STATUS, buf, len, now);
         return;
-    }
     default:
         return;
     }
@@ -812,6 +860,7 @@ void djl_config_defaults(djl_config *cfg)
     cfg->proto_version  = 0x03;
     cfg->send_status    = true;
     cfg->auto_metadata  = true;
+    cfg->allow_media_access = true;
     cfg->log_level      = DJL_LOG_INFO;
 }
 
@@ -822,6 +871,12 @@ djl_err djl_context_create(const djl_config *cfg, djl_context **out)
 
     djl_context *ctx = calloc(1, sizeof *ctx);
     if (!ctx) return DJL_ERR_NOMEM;
+
+    /* "Unknown" for these is -1, not the 0 that calloc leaves behind. */
+    for (int i = 0; i < 64; i++) {
+        ctx->positions[i].track_length_ms = -1;
+        ctx->positions[i].position_ms     = -1;
+    }
 
     ctx->cfg = *cfg;
     snprintf(ctx->name_buf, sizeof ctx->name_buf, "%s",
@@ -1001,6 +1056,17 @@ double djl_master_tempo(djl_context *ctx)
     double t = ctx->master_tempo;
     pthread_mutex_unlock(&ctx->lock);
     return t;
+}
+
+/* Reported by the built library so a consumer can detect a header/library
+ * mismatch that would make djl_poll stride its array wrongly. */
+size_t djl_event_size(void) { return sizeof(djl_event); }
+
+void djl_version(int *major, int *minor, int *patch)
+{
+    if (major) *major = DJL_VERSION_MAJOR;
+    if (minor) *minor = DJL_VERSION_MINOR;
+    if (patch) *patch = DJL_VERSION_PATCH;
 }
 
 int djl_poll(djl_context *ctx, djl_event *out, size_t max, int timeout_ms)

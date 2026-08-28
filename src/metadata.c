@@ -38,11 +38,20 @@ void djl_pos_attach_grid(djl_context *ctx, uint8_t player)
         g = &ctx->meta_cache[player].grid;
     if (ps->grid != g) {
         ps->grid = g;
-        ps->grid_gen++;
         /* A new track invalidates any position we extrapolated for the old one;
          * the next status packet re-anchors us against the new grid. */
         ps->grid_beat_known = false;
     }
+}
+
+void djl_pos_detach_grid(djl_context *ctx, uint8_t player)
+{
+    if (!ctx || player == 0 || player >= 64) return;
+    djl_pos_state *ps = &ctx->positions[player];
+    ps->grid            = NULL;
+    ps->grid_beat_known = false;
+    /* Any grid-derived length belonged to the old track. */
+    if (!ps->from_precise) ps->track_length_ms = -1;
 }
 
 /* ---- worker ---- */
@@ -69,6 +78,11 @@ typedef struct {
     bool has_art;  djl_blob           art;
     bool has_ss;   djl_song_structure ss;
     bool has_sig;  uint8_t            sig[20];
+    /* "We asked and got an answer", as distinct from "the answer was non-empty".
+     * A track with no saved cues is complete, not incomplete: without this the
+     * early-out could never fire for such a track and every load paid for a
+     * second provider it did not need. */
+    bool cues_resolved;
 } fetch_result;
 
 static void result_free(fetch_result *f)
@@ -100,46 +114,131 @@ static void sign_if_possible(fetch_result *f, const djl_waveform_blob *rgb_detai
 
 /* ---- provider: NFS (export.pdb + ANLZ off the player's own media) ---- */
 
+/* Mount cache. Only the metadata worker thread touches ctx->nfs_cache, so no
+ * lock is needed here; djl_nfs is not thread-safe and must not be shared. */
+
+static uint32_t media_gen_of(djl_context *ctx, uint8_t host)
+{
+    pthread_mutex_lock(&ctx->lock);
+    uint32_t g = (host < 64) ? ctx->media_gen[host] : 0;
+    pthread_mutex_unlock(&ctx->lock);
+    return g;
+}
+
+static void nfs_cache_drop(djl_context *ctx, size_t i)
+{
+    if (ctx->nfs_cache[i].h) djl_nfs_close(ctx->nfs_cache[i].h);
+    memset(&ctx->nfs_cache[i], 0, sizeof ctx->nfs_cache[i]);
+}
+
+/* Close every cached mount; called when the worker stops. */
+void djl_nfs_cache_clear(djl_context *ctx)
+{
+    for (size_t i = 0; i < sizeof ctx->nfs_cache / sizeof ctx->nfs_cache[0]; i++)
+        nfs_cache_drop(ctx, i);
+}
+
+/* An open, still-valid mount for this player and slot, opening one if needed.
+ * Re-using it is what keeps a track load from re-downloading export.pdb. */
+static djl_nfs *nfs_cache_get(djl_context *ctx, uint8_t host, djl_slot slot)
+{
+    const size_t n_slots = sizeof ctx->nfs_cache / sizeof ctx->nfs_cache[0];
+    uint32_t gen = media_gen_of(ctx, host);
+
+    size_t victim = 0;
+    uint64_t oldest = UINT64_MAX;
+    for (size_t i = 0; i < n_slots; i++) {
+        if (ctx->nfs_cache[i].h && ctx->nfs_cache[i].host == host &&
+            ctx->nfs_cache[i].slot == (uint8_t)slot) {
+            if (ctx->nfs_cache[i].gen != gen) {
+                /* Media was swapped or the device vanished: the mount and the
+                 * export.pdb behind it are stale. */
+                djl_log(ctx, DJL_LOG_DEBUG,
+                        "metadata: dropping stale NFS mount for player %u", host);
+                nfs_cache_drop(ctx, i);
+                break;
+            }
+            ctx->nfs_cache[i].last_use_ms = djl_now_ms();
+            return ctx->nfs_cache[i].h;
+        }
+        uint64_t age = ctx->nfs_cache[i].h ? ctx->nfs_cache[i].last_use_ms : 0;
+        if (age < oldest) { oldest = age; victim = i; }
+    }
+
+    djl_nfs *h = NULL;
+    if (djl_nfs_open(ctx, host, slot, &h) != DJL_OK) return NULL;
+
+    nfs_cache_drop(ctx, victim);
+    ctx->nfs_cache[victim].h           = h;
+    ctx->nfs_cache[victim].host        = host;
+    ctx->nfs_cache[victim].slot        = (uint8_t)slot;
+    ctx->nfs_cache[victim].gen         = gen;
+    ctx->nfs_cache[victim].last_use_ms = djl_now_ms();
+    return h;
+}
+
 static bool fetch_via_nfs(djl_context *ctx, uint8_t host, djl_slot slot,
                           djl_track_type type, uint32_t id, fetch_result *out)
 {
     if (!djl_nfs_supported()) return false;
+    if (!ctx->cfg.allow_media_access) return false;
     /* Only media that physically exists on disk. CD audio, streaming and
      * rekordbox-collection tracks have no export.pdb to read. */
     if (type != DJL_TRACK_REKORDBOX) return false;
     if (slot != DJL_SLOT_SD && slot != DJL_SLOT_USB) return false;
 
-    djl_nfs *n = NULL;
-    djl_err e = djl_nfs_open(ctx, host, slot, &n);
-    if (e != DJL_OK) {
-        djl_log(ctx, DJL_LOG_DEBUG, "metadata: NFS mount on player %u failed: %s",
-                host, djl_strerror(e));
+    djl_nfs *n = nfs_cache_get(ctx, host, slot);
+    if (!n) {
+        djl_log(ctx, DJL_LOG_DEBUG, "metadata: no NFS mount for player %u", host);
         return false;
     }
+    /* Bound how long one job may spend in the NFS client, so a wedged or
+     * rebooting player cannot pin the single worker thread. */
+    djl_nfs_set_deadline(n, djl_now_ms() + DJL_NFS_JOB_BUDGET_MS);
 
     djl_nfs_track t;
-    e = djl_nfs_fetch_track(n, id, &t);
+    djl_err e = djl_nfs_fetch_track(n, id, &t);
     if (e != DJL_OK) {
         djl_log(ctx, DJL_LOG_DEBUG, "metadata: NFS track %u failed: %s",
                 id, djl_strerror(e));
-        djl_nfs_close(n);
+        /* A timeout or I/O error may have left the mount unusable; drop it so
+         * the next attempt starts clean rather than inheriting the damage. */
+        if (e == DJL_ERR_TIMEOUT || e == DJL_ERR_IO) {
+            for (size_t i = 0; i < sizeof ctx->nfs_cache / sizeof ctx->nfs_cache[0]; i++)
+                if (ctx->nfs_cache[i].h == n) { nfs_cache_drop(ctx, i); break; }
+        }
         return false;
     }
 
-    if (t.has_meta) { out->has_meta = true; out->meta = t.meta; }
-    /* Move ownership of the parsed analysis into the result. */
-    if (t.anlz.has_grid) { out->has_grid = true; out->grid = t.anlz.grid;
-                           memset(&t.anlz.grid, 0, sizeof t.anlz.grid); }
-    if (t.anlz.has_cues) { out->has_cues = true; out->cues = t.anlz.cues;
-                           memset(&t.anlz.cues, 0, sizeof t.anlz.cues); }
-    if (t.anlz.has_ss)   { out->has_ss = true; out->ss = t.anlz.ss;
-                           memset(&t.anlz.ss, 0, sizeof t.anlz.ss); }
-    if (t.anlz.has_preview) { out->has_wave = true; out->wave = t.anlz.preview;
-                              memset(&t.anlz.preview, 0, sizeof t.anlz.preview); }
+    /* Move ownership of the parsed analysis into the result, filling only the
+     * gaps. Every one of these owns heap memory, so overwriting a field an
+     * earlier provider already populated would leak it -- which is exactly what
+     * happened with the provider order {DBSERVER, NFS}, an order the public
+     * API accepts. */
+    if (!out->has_meta && t.has_meta) { out->has_meta = true; out->meta = t.meta; }
+    if (!out->has_grid && t.anlz.has_grid) {
+        out->has_grid = true; out->grid = t.anlz.grid;
+        memset(&t.anlz.grid, 0, sizeof t.anlz.grid);
+    }
+    if (!out->has_cues && t.anlz.has_cues) {
+        out->has_cues = true; out->cues = t.anlz.cues;
+        memset(&t.anlz.cues, 0, sizeof t.anlz.cues);
+    }
+    /* The .DAT/.EXT carry the cue lists, so parsing them settles the question
+     * even when the track simply has none. */
+    if (t.anlz.has_grid || t.anlz.has_cues) out->cues_resolved = true;
+    if (!out->has_ss && t.anlz.has_ss) {
+        out->has_ss = true; out->ss = t.anlz.ss;
+        memset(&t.anlz.ss, 0, sizeof t.anlz.ss);
+    }
+    if (!out->has_wave && t.anlz.has_preview) {
+        out->has_wave = true; out->wave = t.anlz.preview;
+        memset(&t.anlz.preview, 0, sizeof t.anlz.preview);
+    }
 
     sign_if_possible(out, t.anlz.has_rgb_detail ? &t.anlz.rgb_detail : NULL);
 
-    if (out->has_meta && out->meta.artwork_id) {
+    if (!out->has_art && out->has_meta && out->meta.artwork_id) {
         djl_blob art;
         if (djl_nfs_read_artwork(n, out->meta.artwork_id, &art) == DJL_OK) {
             out->has_art = true; out->art = art;
@@ -147,7 +246,7 @@ static bool fetch_via_nfs(djl_context *ctx, uint8_t host, djl_slot slot,
     }
 
     djl_nfs_track_free(&t);
-    djl_nfs_close(n);
+    /* The mount stays open in the cache for the next track load. */
     return result_usable(out);
 }
 
@@ -175,6 +274,7 @@ static bool fetch_via_dbserver(djl_context *ctx, uint8_t host, djl_slot slot,
         out->has_cues = djl_db_cue_list(db, slot, type, id, true, &out->cues) == DJL_OK;
         if (!out->has_cues)
             out->has_cues = djl_db_cue_list(db, slot, type, id, false, &out->cues) == DJL_OK;
+        if (out->has_cues) out->cues_resolved = true;
     }
     if (!out->has_art && out->has_meta && out->meta.artwork_id)
         out->has_art = djl_db_album_art(db, slot, type, out->meta.artwork_id, &out->art) == DJL_OK;
@@ -228,7 +328,7 @@ static void perform_fetch(djl_context *ctx, uint8_t player, uint8_t host,
         }
         /* Stop as soon as we have a complete-enough picture; otherwise let the
          * next provider fill the gaps. */
-        if (ok && res.has_meta && res.has_grid && res.has_cues) break;
+        if (ok && res.has_meta && res.has_grid && res.cues_resolved) break;
     }
     const char *source = via_nfs ? (via_db ? "nfs+dbserver" : "nfs")
                                  : (via_db ? "dbserver" : "none");
@@ -398,6 +498,10 @@ void djl_meta_stop(djl_context *ctx)
     pthread_mutex_unlock(&ctx->lock);
     pthread_join(ctx->meta_thread, NULL);
     ctx->meta_started = false;
+
+    /* The worker owns the NFS mounts, so they can only be released now that it
+     * has exited. Each UMNTs the player before closing. */
+    djl_nfs_cache_clear(ctx);
 
     /* The position trackers borrow grids out of this cache, so drop those
      * references before the storage goes away. */

@@ -24,6 +24,12 @@ djl_err djl_nfs_open_addr(const uint8_t ip[4], djl_slot slot, djl_nfs **out)
 
 void djl_nfs_close(djl_nfs *n) { (void)n; }
 
+void djl_nfs_set_deadline(djl_nfs *n, uint64_t deadline_ms)
+{
+    (void)n; (void)deadline_ms;
+}
+
+
 djl_err djl_nfs_read_file(djl_nfs *n, const char *path, djl_blob *out)
 {
     (void)n; (void)path; (void)out;

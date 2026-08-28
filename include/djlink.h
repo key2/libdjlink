@@ -50,6 +50,13 @@ DJL_API uint64_t djl_now_ms(void);
 #define DJL_PORT_AUDIO    50004
 
 #define DJL_MAGIC_LEN      10
+/* Version. In 0.x the MINOR is bumped for ABI-breaking changes and is part of
+ * the library soname, so a stale shared library cannot be loaded silently.
+ * 0.2.0 grew djl_event from 200 to 256 bytes (djl_rb_link joined its union). */
+#define DJL_VERSION_MAJOR  0
+#define DJL_VERSION_MINOR  2
+#define DJL_VERSION_PATCH  0
+
 #define DJL_NAME_LEN       0x14   /* 20 */
 #define DJL_MAX_PACKET     1500
 
@@ -422,6 +429,13 @@ typedef struct {
     bool              send_status;      /* emit our own CDJ status @200ms */
     bool              observe_only;     /* never transmit anything */
     bool              auto_metadata;    /* auto-fetch metadata/waveform on load */
+    /* Allow reading a player's SD/USB over NFS (mounting its filesystem and
+     * pulling export.pdb and the ANLZ files). Defaults to true because it is
+     * the richest and most reliable metadata source, but it is more intrusive
+     * than a dbserver query, so an installation that must not touch player
+     * media can turn it off and still get everything dbserver offers. Ignored
+     * when observe_only is set, which suppresses all outbound traffic. */
+    bool              allow_media_access;
     djl_log_fn        log;
     void             *log_ud;
     djl_log_level     log_level;
@@ -574,6 +588,19 @@ typedef struct {
 /* Drain up to max events. Blocks up to timeout_ms (0 = non-blocking,
  * negative = wait indefinitely). Returns count, or negative djl_err. */
 DJL_API int djl_poll(djl_context *ctx, djl_event *out, size_t max, int timeout_ms);
+
+/* sizeof(djl_event) and the library version as the *built library* sees them.
+ *
+ * djl_poll writes into a caller-allocated array, so a consumer compiled against
+ * a different djlink.h than the shared library it loads would have the library
+ * stride records at the wrong size and walk off the end of that array. The
+ * soname prevents the usual case; these let FFI bindings and dlopen users check
+ * explicitly:
+ *
+ *     if (djl_event_size() != sizeof(djl_event)) abort();
+ */
+DJL_API size_t djl_event_size(void);
+DJL_API void   djl_version(int *major, int *minor, int *patch);
 
 /* Raw packet hook: called for every datagram carrying valid Pro DJ Link magic,
  * before decoding, including packets the library does not understand. Invoked

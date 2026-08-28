@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.16)
-project(libdjlink C)
+# 0.x: the minor version carries ABI breaks, so it is part of the soname.
+# 0.2.0 grew djl_event (200 -> 256 bytes) by adding djl_rb_link to its union,
+# which is why the soname must change with it.
+project(libdjlink VERSION 0.2.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -77,6 +80,11 @@ add_executable(test_wire tests/test_wire.c tests/test_nfs.c tests/test_position.
 target_include_directories(test_wire PRIVATE tests ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(test_wire PRIVATE djlink)
 add_test(NAME wire COMMAND test_wire)
+
+set_target_properties(djlink PROPERTIES
+  VERSION   ${PROJECT_VERSION}
+  SOVERSION ${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}
+)
 
 install(TARGETS djlink ARCHIVE DESTINATION lib LIBRARY DESTINATION lib)
 install(DIRECTORY include/ DESTINATION include)

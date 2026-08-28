@@ -198,12 +198,32 @@ djl_err djl_nfs2_read(djl_rpc *r, uint16_t port, const djl_fh *fh,
     return DJL_OK;
 }
 
-/* Decode a directory-entry name. Pioneer sends UTF-16LE here as well, but be
- * tolerant: a name whose second byte is not NUL is treated as plain bytes. */
+/* Decode a directory-entry name. Pioneer sends these UTF-16LE, like every other
+ * NFS string.
+ *
+ * The tolerance for plain bytes exists only for non-Pioneer servers; deciding
+ * on src[1] alone was wrong, because any name whose first character is U+0100
+ * or above (Cyrillic, Greek, CJK -- all common in music libraries) has a
+ * non-zero second byte and was then copied out as raw bytes, producing invalid
+ * UTF-8 that no longer round-trips through LOOKUP. Require the NUL in every
+ * odd byte instead, which only genuine UTF-16LE ASCII satisfies. */
+static bool looks_utf16le(const uint8_t *src, size_t n)
+{
+    if (n < 2 || (n % 2) != 0) return false;
+    size_t high_zero = 0, pairs = n / 2;
+    for (size_t i = 0; i < pairs; i++)
+        if (src[i * 2 + 1] == 0) high_zero++;
+    /* All-ASCII UTF-16LE gives every high byte zero. A name with non-Latin
+     * characters gives some non-zero high bytes, but a byte-string name would
+     * have to be pathological to put NUL in most odd positions, so a majority
+     * is a safe discriminator. */
+    return high_zero * 2 >= pairs;
+}
+
 static void decode_entry_name(const uint8_t *src, size_t n, char *out, size_t outsz)
 {
     if (outsz == 0) return;
-    bool u16 = (n >= 2) && (n % 2 == 0) && (src[1] == 0);
+    bool u16 = looks_utf16le(src, n);
     size_t o = 0;
     if (u16) {
         for (size_t i = 0; i + 1 < n; i += 2) {

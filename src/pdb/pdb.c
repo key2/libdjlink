@@ -155,14 +155,28 @@ static bool read_named_row(const uint8_t *page, uint32_t page_size, uint32_t row
 
 /* ---------------- table / page walking ---------------- */
 
-/* Visit every present row of one table type, recording (id, page, row). */
+/* Visit every present row of one table type, recording (id, page, row).
+ *
+ * The page chain is attacker-controlled, so it is walked with a visited bitmap:
+ * rejecting only a self-link lets a two-page cycle be traversed PDB_MAX_PAGES
+ * times, re-indexing the same rows on every pass. A 12 KB file with 32 real
+ * rows produced 1.6 million rowrefs that way, and a large page size pushes it
+ * into the gigabytes. */
 static void index_table(struct djl_pdb *p, uint32_t first_page, uint32_t last_page,
                         uint32_t want_type, rowvec *into, uint32_t id_ofs, int id_size)
 {
+    uint32_t page_count = (uint32_t)(p->len / p->page_size);
+    if (page_count == 0) return;
+    uint8_t *seen = calloc((page_count + 7u) / 8u, 1);
+    if (!seen) return;
+
     uint32_t idx = first_page;
     for (int guard = 0; guard < PDB_MAX_PAGES; guard++) {
+        if (idx >= page_count) break;
+        if (seen[idx >> 3] & (uint8_t)(1u << (idx & 7u))) break;   /* cycle */
+        seen[idx >> 3] |= (uint8_t)(1u << (idx & 7u));
         uint64_t off = (uint64_t)idx * p->page_size;
-        if (off + p->page_size > p->len) return;
+        if (off + p->page_size > p->len) goto done;
         const uint8_t *page = p->d + off;
 
         uint32_t type = rd32(page + 8);
@@ -187,23 +201,32 @@ static void index_table(struct djl_pdb *p, uint32_t first_page, uint32_t last_pa
 
                 for (uint32_t i = 0; i < in_group; i++) {
                     if (!((present >> i) & 1)) continue;   /* deleted row */
+                    /* Bound the slot BEFORE computing it. base can legitimately
+                     * be as small as 6, so base - 6 - i*2 underflows, and a
+                     * check on the result would wrap too (0xfffffffe + 2 == 0)
+                     * and never fire -- that was a ~4 GB out-of-bounds read
+                     * reachable from a malformed export.pdb. */
+                    uint32_t need = 6u + i * 2u + 2u;      /* end of slot i */
+                    if (need > base) break;                /* index off the page */
                     uint32_t ptr = base - 6 - i * 2;
-                    if (ptr + 2 > p->page_size) continue;
                     uint32_t row = PDB_HEAP_POS + rd16(page + ptr);
                     if (row + id_ofs + (uint32_t)id_size > p->page_size) continue;
                     uint32_t id = (id_size == 2) ? rd16(page + row + id_ofs)
                                                  : rd32(page + row + id_ofs);
-                    if (!vec_push(into, id, (uint32_t)off, (uint16_t)row)) return;
+                    if (!vec_push(into, id, (uint32_t)off, (uint16_t)row)) goto done;
                 }
             }
         }
 
-        if (idx == last_page) return;
-        if (next == idx || next == 0) return;                /* malformed chain */
+        if (idx == last_page) goto done;
+        if (next == idx || next == 0) goto done;             /* malformed chain */
         uint64_t noff = (uint64_t)next * p->page_size;
-        if (noff + p->page_size > p->len) return;
+        if (noff + p->page_size > p->len) goto done;
         idx = next;
     }
+
+done:
+    free(seen);
 }
 
 djl_err djl_pdb_open(const uint8_t *data, size_t len, djl_pdb **out)

@@ -83,6 +83,20 @@ static bool cues_reserve(djl_cue_list *c, uint32_t extra)
     return true;
 }
 
+/* Is this cue already in the list? PCOB occurs in both .DAT and .EXT of the
+ * same track, and both files are parsed into one djl_anlz, so without this the
+ * whole basic cue list is emitted twice whenever there is no PCO2 to reset it. */
+static bool cue_already_present(const djl_cue_list *c, const djl_cue_entry *n)
+{
+    for (uint32_t i = 0; i < c->count; i++) {
+        const djl_cue_entry *e = &c->entries[i];
+        if (e->start_ms == n->start_ms && e->hot_cue == n->hot_cue &&
+            e->is_loop == n->is_loop && e->end_ms == n->end_ms)
+            return true;
+    }
+    return false;
+}
+
 /* PCOB: basic cue list, PCPT entries, no colors or comments. */
 static void parse_pcob(const uint8_t *b, uint32_t len, djl_anlz *out)
 {
@@ -100,12 +114,23 @@ static void parse_pcob(const uint8_t *b, uint32_t len, djl_anlz *out)
 
         uint32_t hot  = be32(e + 0x0c);
         uint8_t  kind = e[0x1c];                             /* 1 = cue, 2 = loop */
-        djl_cue_entry *c = &out->cues.entries[out->cues.count + added];
-        c->hot_cue  = (hot > 0 && hot < 256) ? (uint8_t)hot : 0;
-        c->start_ms = be32(e + 0x20);
-        if (kind == 2) { c->is_loop = true; c->end_ms = be32(e + 0x24); }
-        added++;
+        /* Deliberately NOT filtering on the u4 at 0x10 that the Kaitai spec
+         * calls "status". Live CDJ-3000X exports carry status 0 on hot cues
+         * that are demonstrably active (both cues of track 33, confirmed
+         * against the dbserver path), and beat-link's CueList.addEntriesFromTag
+         * emits every entry regardless, so treating 0 as "deleted" would drop
+         * real memory points. */
+
+        djl_cue_entry cue;
+        memset(&cue, 0, sizeof cue);
+        cue.hot_cue  = (hot > 0 && hot < 256) ? (uint8_t)hot : 0;
+        cue.start_ms = be32(e + 0x20);
+        if (kind == 2) { cue.is_loop = true; cue.end_ms = be32(e + 0x24); }
         pos += esz;
+
+        if (cue_already_present(&out->cues, &cue)) continue;
+        out->cues.entries[out->cues.count + added] = cue;
+        added++;
     }
     out->cues.count += added;
     if (out->cues.count) out->has_cues = true;
@@ -141,34 +166,40 @@ static void parse_pco2(const uint8_t *b, uint32_t len, djl_anlz *out)
         if (kind == 2) { c->is_loop = true; c->end_ms = be32(e + 0x18); }
 
         /* A UTF-16BE comment of len_comment bytes sits at 0x2c, and the color
-         * follows it. Older exports truncate the entry before either. */
-        uint32_t clen = 0;
-        if (esz >= 0x2c) {
-            clen = be32(e + 0x28);
-            if (clen > 2 && clen < 512 && 0x2c + clen <= esz) {
-                size_t o = 0;
-                for (uint32_t k = 0; k + 1 < clen && o + 3 < sizeof c->comment; k += 2) {
-                    uint32_t cp = ((uint32_t)e[0x2c + k] << 8) | e[0x2c + k + 1];
-                    if (cp == 0) break;
-                    if (cp < 0x80)       c->comment[o++] = (char)cp;
-                    else if (cp < 0x800) { c->comment[o++] = (char)(0xc0 | (cp >> 6));
-                                           c->comment[o++] = (char)(0x80 | (cp & 0x3f)); }
-                    else                 { c->comment[o++] = (char)(0xe0 | (cp >> 12));
-                                           c->comment[o++] = (char)(0x80 | ((cp >> 6) & 0x3f));
-                                           c->comment[o++] = (char)(0x80 | (cp & 0x3f)); }
-                }
-                c->comment[o] = '\0';
-            } else {
-                clen = 0;
+         * follows it. Older exports truncate the entry before either.
+         *
+         * The declared length always determines where the color lives, exactly
+         * as the dbserver parser does. Zeroing it on an implausible value used
+         * to rebase the color read into the middle of the comment, so the same
+         * cue got a different color depending on which provider served it. */
+        uint32_t clen = (esz >= 0x2c) ? be32(e + 0x28) : 0;
+        bool comment_ok = clen > 2 && clen < 512 && 0x2c + clen <= esz;
+        if (comment_ok) {
+            size_t o = 0;
+            for (uint32_t k = 0; k + 1 < clen && o + 3 < sizeof c->comment; k += 2) {
+                uint32_t cp = ((uint32_t)e[0x2c + k] << 8) | e[0x2c + k + 1];
+                if (cp == 0) break;
+                if (cp < 0x80)       c->comment[o++] = (char)cp;
+                else if (cp < 0x800) { c->comment[o++] = (char)(0xc0 | (cp >> 6));
+                                       c->comment[o++] = (char)(0x80 | (cp & 0x3f)); }
+                else                 { c->comment[o++] = (char)(0xe0 | (cp >> 12));
+                                       c->comment[o++] = (char)(0x80 | ((cp >> 6) & 0x3f));
+                                       c->comment[o++] = (char)(0x80 | (cp & 0x3f)); }
             }
+            c->comment[o] = '\0';
         }
-        uint32_t coff = 0x2c + clen;
-        if (coff + 4 <= esz) {
-            c->color_id = e[coff];
-            c->r = e[coff + 1]; c->g = e[coff + 2]; c->b = e[coff + 3];
-            if (!(c->r || c->g || c->b) && c->color_id)
-                djl_rekordbox_color(c->color_id, &c->r, &c->g, &c->b);
-            c->has_color = (c->r || c->g || c->b || c->color_id);
+        /* Only read the color where the entry says it is. If the declared
+         * comment length is nonsense, the color position is unknowable, so
+         * report no color rather than a plausible-looking wrong one. */
+        if (clen == 0 || comment_ok) {
+            uint32_t coff = 0x2c + clen;
+            if (coff + 4 <= esz) {
+                c->color_id = e[coff];
+                c->r = e[coff + 1]; c->g = e[coff + 2]; c->b = e[coff + 3];
+                if (!(c->r || c->g || c->b) && c->color_id)
+                    djl_rekordbox_color(c->color_id, &c->r, &c->g, &c->b);
+                c->has_color = (c->r || c->g || c->b || c->color_id);
+            }
         }
         added++;
         pos += esz;
@@ -255,20 +286,28 @@ static void parse_rgb_detail(const uint8_t *b, uint32_t len, djl_anlz *out)
     out->has_rgb_detail    = true;
 }
 
-/* PWAV (blue preview) and PWV3 (blue detail) store u4 len_preview, u4 unknown,
- * then one byte per segment. The dbserver blue preview is two bytes per
- * segment (height, whiteness), so expand to keep one accessor for both. */
-static void parse_wave_blue(const uint8_t *b, uint32_t len, djl_anlz *out, bool detail)
+/* PWV3 (blue detail / "wave scroll") is a SIZED tag like PWV4/5/6/7 -- u4
+ * len_entry_bytes, u4 len_entries, u4 unknown, then entries -- NOT a PWAV-style
+ * tag. Parsing it as PWAV read len_entry_bytes (1) as the segment count and
+ * produced a single garbage byte instead of the whole waveform. */
+static void parse_pwv3(const uint8_t *b, uint32_t len, djl_anlz *out)
+{
+    const uint8_t *data = NULL;
+    uint32_t bytes = 0;
+    if (!wave_entries(b, len, &data, &bytes)) return;
+    set_wave(out, true, DJL_WAVE_BLUE, data, bytes);
+}
+
+/* PWAV (blue preview) stores u4 len_preview, u4 unknown, then one byte per
+ * segment. The dbserver blue preview is two bytes per segment (height,
+ * whiteness), so expand to keep one accessor for both. */
+static void parse_wave_blue(const uint8_t *b, uint32_t len, djl_anlz *out)
 {
     if (len < 8) return;
     uint32_t n = be32(b);
     if (n == 0 || n > ANLZ_MAX_ENTRIES || 8 + (uint64_t)n > len) return;
     const uint8_t *src = b + 8;
 
-    if (detail) {                       /* already 1 byte per segment */
-        set_wave(out, true, DJL_WAVE_BLUE, src, n);
-        return;
-    }
     djl_waveform_blob *slot = &out->preview;
     if (out->has_preview && wave_rank(slot->style) >= wave_rank(DJL_WAVE_BLUE)) return;
     uint8_t *copy = malloc((size_t)n * 2);
@@ -332,8 +371,8 @@ djl_err djl_anlz_parse(const uint8_t *data, size_t len, djl_anlz *inout)
         case T_PCOB: parse_pcob(body, blen, inout); break;
         case T_PCO2: parse_pco2(body, blen, inout); break;
         case T_PPTH: parse_ppth(body, blen, inout); break;
-        case T_PWAV: parse_wave_blue(body, blen, inout, false); break;
-        case T_PWV3: parse_wave_blue(body, blen, inout, true);  break;
+        case T_PWAV: parse_wave_blue(body, blen, inout); break;
+        case T_PWV3: parse_pwv3(body, blen, inout); break;
         case T_PWV4: parse_wave_sized(body, blen, inout, false, DJL_WAVE_RGB); break;
         case T_PWV5: parse_wave_sized(body, blen, inout, true,  DJL_WAVE_RGB);
                      parse_rgb_detail(body, blen, inout); break;
