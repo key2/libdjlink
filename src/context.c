@@ -485,6 +485,75 @@ static void emit_unknown_packet(djl_context *ctx, uint16_t port,
     djl_emit(ctx, &ev);
 }
 
+/* Channel count for a DJM, from its model name (V10 is the only 6-channel
+ * mixer); defaults to 4. */
+static uint8_t djm_channels(djl_context *ctx, uint8_t number)
+{
+    djl_slot_entry *e = roster_find(ctx, number);
+    if (e && strstr(e->info.name, "V10")) return 6;
+    return 4;
+}
+
+/* Decode a 0x39 fader-status packet, cache it per mixer, and emit it. */
+static void handle_djm_mixer(djl_context *ctx, const uint8_t *buf, size_t len, uint64_t now)
+{
+    uint8_t number = (len > 0x21) ? buf[0x21] : 0;
+    djl_djm_mixer m;
+    if (djl_decode_djm_mixer(buf, len, djm_channels(ctx, number), &m) != DJL_OK) return;
+
+    djl_slot_entry *e = roster_find(ctx, m.number);
+    if (e) e->info.last_seen_ms = now - ctx->t0;
+
+    /* Cache: reuse this mixer's slot, else the first free one. */
+    size_t slot = 0, n = sizeof ctx->djm_mixer / sizeof ctx->djm_mixer[0];
+    for (size_t i = 0; i < n; i++) {
+        if (ctx->djm_mixer[i].valid && ctx->djm_mixer[i].number == m.number) { slot = i; break; }
+        if (!ctx->djm_mixer[i].valid) { slot = i; }
+    }
+    ctx->djm_mixer[slot].valid  = true;
+    ctx->djm_mixer[slot].number = m.number;
+    ctx->djm_mixer[slot].m      = m;
+
+    djl_event ev;
+    memset(&ev, 0, sizeof ev);
+    ev.kind    = DJL_EV_DJM_MIXER;
+    ev.device  = m.number;
+    ev.time_ms = now - ctx->t0;
+    ev.u.djm_mixer = m;
+    djl_emit(ctx, &ev);
+}
+
+/* Decode a 0x58 VU packet, cache the full ladders, and emit just the peaks. */
+static void handle_vu_meters(djl_context *ctx, const uint8_t *buf, size_t len, uint64_t now)
+{
+    uint8_t number = (len > 0x21) ? buf[0x21] : 0;
+    djl_vu_meters v;
+    if (djl_decode_vu_meters(buf, len, djm_channels(ctx, number), &v) != DJL_OK) return;
+
+    djl_slot_entry *e = roster_find(ctx, v.number);
+    if (e) e->info.last_seen_ms = now - ctx->t0;
+
+    size_t slot = 0, n = sizeof ctx->vu_meters / sizeof ctx->vu_meters[0];
+    for (size_t i = 0; i < n; i++) {
+        if (ctx->vu_meters[i].valid && ctx->vu_meters[i].number == v.number) { slot = i; break; }
+        if (!ctx->vu_meters[i].valid) { slot = i; }
+    }
+    ctx->vu_meters[slot].valid  = true;
+    ctx->vu_meters[slot].number = v.number;
+    ctx->vu_meters[slot].v      = v;
+
+    djl_event ev;
+    memset(&ev, 0, sizeof ev);
+    ev.kind    = DJL_EV_VU_METERS;
+    ev.device  = v.number;
+    ev.time_ms = now - ctx->t0;
+    ev.u.vu_peaks.number   = v.number;
+    ev.u.vu_peaks.channels = v.channels;
+    memcpy(ev.u.vu_peaks.channel_peak, v.channel_peak, sizeof v.channel_peak);
+    memcpy(ev.u.vu_peaks.master_peak,  v.master_peak,  sizeof v.master_peak);
+    djl_emit(ctx, &ev);
+}
+
 static void handle_status(djl_context *ctx, const uint8_t *buf, size_t len,
                           uint64_t now)
 {
@@ -582,6 +651,12 @@ static void handle_status(djl_context *ctx, const uint8_t *buf, size_t len,
         note_master(ctx, ms.number, ms.master, ms.effective_bpm, now);
         return;
     }
+    case DJL_PKT_MIXER_STATE_A9:
+        handle_djm_mixer(ctx, buf, len, now);   /* 0x39, usually on 50002 */
+        return;
+    case DJL_PKT_VU_STREAM:
+        handle_vu_meters(ctx, buf, len, now);   /* 0x58, if a DJM sends it here */
+        return;
     case DJL_PKT_MEDIA_RESPONSE: {
         djl_media_details md;
         if (djl_decode_media_details(buf, len, &md) != DJL_OK) return;
@@ -714,6 +789,12 @@ static void handle_beat(djl_context *ctx, const uint8_t *buf, size_t len,
         djl_emit(ctx, &ev);
         return;
     }
+    case DJL_PKT_VU_STREAM:
+        handle_vu_meters(ctx, buf, len, now);    /* 0x58 arrives here (50001) */
+        return;
+    case DJL_PKT_MIXER_STATE_A9:
+        handle_djm_mixer(ctx, buf, len, now);    /* some firmware sends 0x39 here too */
+        return;
     case DJL_PKT_UNKNOWN: {
         djl_event ev;
         memset(&ev, 0, sizeof ev);
@@ -750,12 +831,36 @@ static void handle_audio(djl_context *ctx, const uint8_t *buf, size_t len,
 
 /* ---------------- periodic transmit ---------------- */
 
+static bool is_djm(const djl_device_info *d)
+{
+    return d->device_type == DJL_DEVTYPE_MIXER ||
+           d->device_type == DJL_DEVTYPE_MIXER_MODERN ||
+           d->number >= 0x21;                 /* mixers sit at 33+ */
+}
+
 static void send_keep_alive(djl_context *ctx)
 {
     uint8_t buf[DJL_MAX_PACKET];
     ctx->id.peer_count = (uint8_t)(roster_count(ctx) + 1);
     size_t n = djl_build_keep_alive(buf, sizeof buf, &ctx->id);
-    bcast(ctx, &ctx->sock_announce, buf, n);
+    if (!n) return;
+
+    /* In bridge mode the DJM must see ONLY our 0xF9 bridge identity: a DJM that
+     * sees both a CDJ keepalive and the bridge keepalive from one IP/MAC treats
+     * them as conflicting and refuses to stream faders (SuperTimecodeConverter,
+     * confirmed live on a DJM-A9). So unicast the virtual-CDJ keepalive to the
+     * CDJs that need it and let bridge_tick broadcast the bridge identity;
+     * outside bridge mode, broadcast as usual. */
+    if (ctx->cfg.djm_bridge) {
+        for (size_t i = 0; i < DJL_MAX_DEVICES; i++) {
+            if (!ctx->devices[i].used) continue;
+            if (is_djm(&ctx->devices[i].info)) continue;   /* never to the DJM */
+            unicast(ctx, &ctx->sock_announce, ctx->devices[i].info.ip,
+                    DJL_PORT_ANNOUNCE, buf, n);
+        }
+    } else {
+        bcast(ctx, &ctx->sock_announce, buf, n);
+    }
 }
 
 static void send_status_to_all(djl_context *ctx)
@@ -773,6 +878,36 @@ static void send_status_to_all(djl_context *ctx)
         if (!ctx->devices[i].used) continue;
         unicast(ctx, &ctx->sock_status, ctx->devices[i].info.ip,
                 DJL_PORT_STATUS, buf, n);
+    }
+}
+
+/* ---------------- DJM bridge ---------------- */
+
+/* Announce the bridge identity (broadcast) and subscribe to each DJM so it
+ * begins streaming fader (0x39) and VU (0x58) packets. */
+static void bridge_tick(djl_context *ctx, uint64_t now)
+{
+    uint8_t buf[DJL_MAX_PACKET];
+
+    if (now >= ctx->next_bridge_ka) {
+        size_t n = djl_build_bridge_keep_alive(buf, sizeof buf, &ctx->id);
+        if (n) bcast(ctx, &ctx->sock_announce, buf, n);
+        ctx->next_bridge_ka = now + 1500;      /* DJM wants ~1.5 s cadence */
+    }
+
+    /* Delay the first subscribe until the DJM has had a couple of keepalives to
+     * register the bridge, or it ignores the 0x57 (seen on the A9). */
+    if (now - ctx->bridge_since_ms < 3000) return;
+    if (now < ctx->next_bridge_sub) return;
+    ctx->next_bridge_sub = now + 2000;         /* DJM drops us without ~2 s renew */
+
+    size_t n = djl_build_bridge_subscribe(buf, sizeof buf, &ctx->id);
+    if (!n) return;
+    djl_sock *sub = (ctx->sock_bridge.fd >= 0) ? &ctx->sock_bridge : &ctx->sock_beat;
+    for (size_t i = 0; i < DJL_MAX_DEVICES; i++) {
+        if (!ctx->devices[i].used) continue;
+        if (!is_djm(&ctx->devices[i].info)) continue;
+        djl_sock_send(sub, ctx->devices[i].info.ip, DJL_PORT_BEAT, buf, n);
     }
 }
 
@@ -836,6 +971,10 @@ static void *io_thread(void *arg)
             if (!ctx->cfg.observe_only && now >= ctx->next_status) {
                 send_status_to_all(ctx);
                 ctx->next_status = now + STATUS_MS;
+            }
+            if (ctx->cfg.djm_bridge && !ctx->cfg.observe_only) {
+                if (ctx->bridge_since_ms == 0) ctx->bridge_since_ms = now;
+                bridge_tick(ctx, now);
             }
         }
         if (now >= ctx->next_expiry) {
@@ -930,6 +1069,12 @@ djl_err djl_context_start(djl_context *ctx)
     if ((e = djl_sock_open(&ctx->sock_status,   DJL_PORT_STATUS,   ifn)) != DJL_OK) goto fail;
     if ((e = djl_sock_open(&ctx->sock_audio,    DJL_PORT_AUDIO,    ifn)) != DJL_OK) goto fail;
 
+    /* Ephemeral send socket for the DJM bridge subscribe. Non-fatal if it
+     * fails: without it we simply cannot subscribe, so faders/VU stay silent. */
+    ctx->sock_bridge.fd = DJL_BAD_FD;
+    if (ctx->cfg.djm_bridge && djl_udp_open(&ctx->sock_bridge) != DJL_OK)
+        djl_log(ctx, DJL_LOG_WARN, "bridge subscribe socket unavailable");
+
     ctx->t0 = djl_now_ms();
     ctx->next_expiry = ctx->t0 + EXPIRY_TICK_MS;
     enter_state(ctx, DJL_ST_WATCHING, ctx->t0);
@@ -964,6 +1109,7 @@ fail:
     djl_sock_close(&ctx->sock_beat);
     djl_sock_close(&ctx->sock_status);
     djl_sock_close(&ctx->sock_audio);
+    djl_sock_close(&ctx->sock_bridge);
     return e;
 }
 
@@ -982,6 +1128,7 @@ void djl_context_stop(djl_context *ctx)
     djl_sock_close(&ctx->sock_beat);
     djl_sock_close(&ctx->sock_status);
     djl_sock_close(&ctx->sock_audio);
+    djl_sock_close(&ctx->sock_bridge);
 }
 
 void djl_context_destroy(djl_context *ctx)
@@ -1026,6 +1173,32 @@ djl_err djl_cdj_status_for(djl_context *ctx, uint8_t number, djl_cdj_status *out
     djl_slot_entry *e = roster_find(ctx, number);
     bool have = e && e->has_status;
     if (have) *out = e->status;
+    pthread_mutex_unlock(&ctx->lock);
+    return have ? DJL_OK : DJL_ERR_NOT_FOUND;
+}
+
+djl_err djl_djm_mixer_for(djl_context *ctx, uint8_t number, djl_djm_mixer *out)
+{
+    if (!ctx || !out) return DJL_ERR_INVAL;
+    bool have = false;
+    pthread_mutex_lock(&ctx->lock);
+    for (size_t i = 0; i < sizeof ctx->djm_mixer / sizeof ctx->djm_mixer[0]; i++)
+        if (ctx->djm_mixer[i].valid && ctx->djm_mixer[i].number == number) {
+            *out = ctx->djm_mixer[i].m; have = true; break;
+        }
+    pthread_mutex_unlock(&ctx->lock);
+    return have ? DJL_OK : DJL_ERR_NOT_FOUND;
+}
+
+djl_err djl_vu_meters_for(djl_context *ctx, uint8_t number, djl_vu_meters *out)
+{
+    if (!ctx || !out) return DJL_ERR_INVAL;
+    bool have = false;
+    pthread_mutex_lock(&ctx->lock);
+    for (size_t i = 0; i < sizeof ctx->vu_meters / sizeof ctx->vu_meters[0]; i++)
+        if (ctx->vu_meters[i].valid && ctx->vu_meters[i].number == number) {
+            *out = ctx->vu_meters[i].v; have = true; break;
+        }
     pthread_mutex_unlock(&ctx->lock);
     return have ? DJL_OK : DJL_ERR_NOT_FOUND;
 }

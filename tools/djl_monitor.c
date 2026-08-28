@@ -17,6 +17,7 @@ static int  g_verbose   = 0;
 static int  g_show_beat = 1;
 static int  g_show_pos  = 0;
 static int  g_show_stat = 0;
+static int  g_show_mixer = 0;
 static int  g_dump_kind = -1;   /* kind byte to hexdump, -1 = none */
 static int  g_dumped    = 0;
 static int  g_dump_max  = 2;
@@ -234,6 +235,28 @@ static void handle(const djl_event *ev, djl_context *ctx)
         for (int i = 0; i < 20; i++) printf("%02x", ev->u.signature.sha1[i]);
         printf("\n");
         break;
+    case DJL_EV_DJM_MIXER: {
+        if (!g_show_mixer) break;
+        const djl_djm_mixer *m = &ev->u.djm_mixer;
+        printf("mixer p%-2u %-10s %uch  xf=%3u masterFader=%3u booth=%3u  ",
+               m->number, m->name, m->channels, m->crossfader,
+               m->master_fader, m->booth);
+        for (int c = 0; c < m->channels; c++)
+            printf("CH%d[f=%3u hi=%3u mid=%3u lo=%3u col=%3u] ",
+                   c + 1, m->ch[c].fader, m->ch[c].eq_hi, m->ch[c].eq_mid,
+                   m->ch[c].eq_lo, m->ch[c].color);
+        printf("\n");
+        break;
+    }
+    case DJL_EV_VU_METERS: {
+        if (!g_show_mixer) break;
+        const typeof(ev->u.vu_peaks) *v = &ev->u.vu_peaks;
+        printf("vu    p%-2u %uch  ", v->number, v->channels);
+        for (int c = 0; c < v->channels; c++)
+            printf("CH%d=%5u ", c + 1, v->channel_peak[c]);
+        printf(" M=%u/%u\n", v->master_peak[0], v->master_peak[1]);
+        break;
+    }
     case DJL_EV_REKORDBOX_LINK: {
         const djl_rb_link *r = &ev->u.rb_link;
         printf("rblnk 0x%02x %-13s dev=%-3u sub=%u len=%u%s",
@@ -288,6 +311,7 @@ static void usage(const char *argv0)
         "  -C <n>       how many packets -X should dump (default 2)\n"
         "  -P <port>    restrict -X to one port\n"
         "  -M           query every media slot on every player once online\n"
+        "  -D           act as a DJM bridge: subscribe + show mixer/VU\n"
         "  -t <sec>     run for N seconds then exit (default: until Ctrl-C)\n"
         "  -h           this help\n", argv0);
 }
@@ -299,7 +323,8 @@ int main(int argc, char **argv)
     unsigned model = 0x64;
 
     int opt;
-    while ((opt = getopt(argc, argv, "i:n:N:m:oqspBvt:X:C:P:Mh")) != -1) {
+    int bridge = 0;
+    while ((opt = getopt(argc, argv, "i:n:N:m:oqspBvt:X:C:P:MDh")) != -1) {
         switch (opt) {
         case 'i': iface = optarg; break;
         case 'n': number = atoi(optarg); break;
@@ -308,6 +333,7 @@ int main(int argc, char **argv)
         case 'o': observe = 1; break;
         case 'q': quiet_status = 1; break;
         case 's': g_show_stat = 1; break;
+        case 'D': bridge = 1; g_show_mixer = 1; break;
         case 'p': g_show_pos = 1; break;
         case 'B': g_show_beat = 0; break;
         case 'v': g_verbose = 1; break;
@@ -336,6 +362,7 @@ int main(int argc, char **argv)
     cfg.model_code   = (uint8_t)model;
     cfg.observe_only = observe != 0;
     cfg.send_status  = !quiet_status && !observe;
+    cfg.djm_bridge   = bridge != 0;
     cfg.log          = logger;
     cfg.log_level    = g_verbose ? DJL_LOG_DEBUG : DJL_LOG_INFO;
 

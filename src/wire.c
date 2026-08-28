@@ -60,6 +60,8 @@ djl_packet_kind djl_wire_classify(uint16_t port, const uint8_t *buf, size_t len)
         case 0x27: return DJL_PKT_MASTER_HANDOFF_RESP;
         case 0x28: return DJL_PKT_BEAT;
         case 0x2a: return DJL_PKT_SYNC_CONTROL;
+        case 0x39: return DJL_PKT_MIXER_STATE_A9;  /* DJM fader status (bridge) */
+        case 0x58: return DJL_PKT_VU_STREAM;       /* DJM VU meters (bridge) */
         case 0x6a: return DJL_PKT_BEAT_HEARTBEAT;
         default:   return DJL_PKT_UNKNOWN;
         }
@@ -413,6 +415,143 @@ djl_err djl_decode_mixer_status(const uint8_t *buf, size_t len, djl_mixer_status
     return DJL_OK;
 }
 
+/* ---------------- DJM-A9 / V10 mixer state (0x39) ---------------- */
+
+/* The 0x39 fader-status packet is unicast by a DJM only to a subscribed bridge
+ * (see the djm_bridge config and ARCHITECTURE.md section 1.12). Layout is
+ * identical across DJM models at 248 bytes; a model that lacks a control simply
+ * reports 0 there. Field map ported from SuperTimecodeConverter and verified
+ * live against a DJM-A9. Every field is a single raw byte, so there is no
+ * endianness to worry about; each is guarded by an explicit length check.
+ *
+ * Per-channel strips are 0x18 bytes apart: CH1-CH4 at 0x24/0x3c/0x54/0x6c and,
+ * on the V10, CH5/CH6 at 0x84/0x9c. */
+djl_err djl_decode_djm_mixer(const uint8_t *buf, size_t len, uint8_t channels,
+                             djl_djm_mixer *out)
+{
+    if (!buf || !out) return DJL_ERR_INVAL;
+    if (!djl_wire_has_magic(buf, len)) return DJL_ERR_UNKNOWN;
+    if (buf[0x0a] != 0x39) return DJL_ERR_UNKNOWN;
+    if (len < 0xe6) return DJL_ERR_SHORT;           /* through the HP-A block */
+    memset(out, 0, sizeof *out);
+
+    djl_err e = djl_wire_device_name(DJL_PORT_STATUS, buf, len, out->name, sizeof out->name);
+    if (e != DJL_OK) return e;
+
+    out->number   = buf[0x21];
+    out->channels = (channels == 6) ? 6 : 4;
+
+    static const uint16_t ch_base[6] = { 0x24, 0x3c, 0x54, 0x6c, 0x84, 0x9c };
+    for (uint8_t c = 0; c < out->channels; c++) {
+        uint16_t b = ch_base[c];
+        if ((size_t)b + 13 > len) break;
+        djl_djm_channel *ch = &out->ch[c];
+        ch->input_src = buf[b + 0];  ch->trim      = buf[b + 1];
+        ch->comp      = buf[b + 2];  ch->eq_hi     = buf[b + 3];
+        ch->eq_mid    = buf[b + 4];  ch->eq_lo_mid = buf[b + 5];
+        ch->eq_lo     = buf[b + 6];  ch->color     = buf[b + 7];
+        ch->send      = buf[b + 8];  ch->cue       = buf[b + 9];
+        ch->cue_b     = buf[b + 10]; ch->fader     = buf[b + 11];
+        ch->xf_assign = buf[b + 12];
+    }
+
+    /* Master / crossfader / isolator / booth. */
+    if (0x0c1 < len) {
+        out->crossfader   = buf[0x0b4]; out->fader_curve  = buf[0x0b5];
+        out->xf_curve     = buf[0x0b6]; out->master_fader = buf[0x0b7];
+        out->master_cue   = buf[0x0b9]; out->master_cue_b = buf[0x0ba];
+        out->isolator_on  = buf[0x0bb]; out->isolator_hi  = buf[0x0bc];
+        out->isolator_mid = buf[0x0bd]; out->isolator_lo  = buf[0x0be];
+        out->booth        = buf[0x0bf]; out->booth_eq_hi  = buf[0x0c0];
+        out->booth_eq_lo  = buf[0x0c1];
+    }
+    /* Headphones A (booth EQ button shares the HP-A block at 0x0e5). */
+    if (0x0e5 < len) {
+        out->hp_cue_link = buf[0x0c4];
+        out->hp_mixing   = buf[0x0e3];
+        out->hp_level    = buf[0x0e4];
+        out->booth_eq    = buf[0x0e5];
+    }
+    if (0x0e7 < len) {
+        out->hp_cue_link_b = buf[0x0c5];
+        out->hp_mixing_b   = buf[0x0e6];
+        out->hp_level_b    = buf[0x0e7];
+    }
+    /* Beat FX. */
+    if (0x0cf < len) {
+        out->fx_freq_lo     = buf[0x0c6]; out->fx_freq_mid = buf[0x0c7];
+        out->fx_freq_hi     = buf[0x0c8]; out->beat_fx_select = buf[0x0c9];
+        out->beat_fx_assign = buf[0x0ca]; out->beat_fx_level  = buf[0x0cb];
+        out->beat_fx_on     = buf[0x0cc]; out->multi_io_select = buf[0x0ce];
+        out->multi_io_level = buf[0x0cf]; out->send_return    = buf[0x0cf];
+    }
+    /* Color FX / external sends. */
+    if (0x0e2 < len) {
+        out->color_fx_select = buf[0x0db]; out->send_ext1 = buf[0x0dc];
+        out->send_ext2       = buf[0x0dd]; out->color_fx_param = buf[0x0e2];
+    }
+    /* Mic EQ. */
+    if (0x0d7 < len) {
+        out->mic_eq_hi = buf[0x0d6];
+        out->mic_eq_lo = buf[0x0d7];
+    }
+    /* Filter (V10). */
+    if (0x0da < len) {
+        out->filter_lpf  = buf[0x0d8];
+        out->filter_hpf  = buf[0x0d9];
+        out->filter_reso = buf[0x0da];
+    }
+    return DJL_OK;
+}
+
+/* ---------------- DJM VU meters (0x58) ---------------- */
+
+/* The 0x58 VU stream is also bridge-only, ~30 Hz on port 50001. Each meter is
+ * fifteen big-endian u16 segments on a 0x3c stride. 4-channel layout: CH1-CH4
+ * then Master L/R; the V10 appends CH5/CH6 after Master R. */
+djl_err djl_decode_vu_meters(const uint8_t *buf, size_t len, uint8_t channels,
+                             djl_vu_meters *out)
+{
+    if (!buf || !out) return DJL_ERR_INVAL;
+    if (!djl_wire_has_magic(buf, len)) return DJL_ERR_UNKNOWN;
+    if (buf[0x0a] != 0x58) return DJL_ERR_UNKNOWN;
+    if (len < 0x176) return DJL_ERR_SHORT;          /* through 4-ch Master R */
+    memset(out, 0, sizeof *out);
+
+    djl_err e = djl_wire_device_name(DJL_PORT_STATUS, buf, len, out->name, sizeof out->name);
+    if (e != DJL_OK) return e;
+
+    out->number   = buf[0x21];
+    out->channels = (channels == 6) ? 6 : 4;
+
+    static const uint16_t ch_off[6]     = { 0x02c, 0x068, 0x0a4, 0x0e0, 0x194, 0x1d0 };
+    static const uint16_t master_off[2] = { 0x11c, 0x158 };
+
+    for (uint8_t c = 0; c < out->channels; c++) {
+        uint16_t base = ch_off[c];
+        if ((size_t)base + DJL_VU_SEGMENTS * 2 > len) continue;
+        uint16_t peak = 0;
+        for (int s = 0; s < DJL_VU_SEGMENTS; s++) {
+            uint16_t v = (uint16_t)((buf[base + s * 2] << 8) | buf[base + s * 2 + 1]);
+            out->channel_seg[c][s] = v;
+            if (v > peak) peak = v;
+        }
+        out->channel_peak[c] = peak;
+    }
+    for (int m = 0; m < 2; m++) {
+        uint16_t base = master_off[m];
+        if ((size_t)base + DJL_VU_SEGMENTS * 2 > len) continue;
+        uint16_t peak = 0;
+        for (int s = 0; s < DJL_VU_SEGMENTS; s++) {
+            uint16_t v = (uint16_t)((buf[base + s * 2] << 8) | buf[base + s * 2 + 1]);
+            out->master_seg[m][s] = v;
+            if (v > peak) peak = v;
+        }
+        out->master_peak[m] = peak;
+    }
+    return DJL_OK;
+}
+
 djl_err djl_decode_beat(const uint8_t *buf, size_t len, djl_beat *out)
 {
     if (!out) return DJL_ERR_INVAL;
@@ -653,6 +792,8 @@ const char *djl_event_kind_name(djl_event_kind k)
     case DJL_EV_SONG_STRUCTURE:      return "SongStructure";
     case DJL_EV_UNKNOWN_PACKET:      return "UnknownPacket";
     case DJL_EV_REKORDBOX_LINK:      return "RekordboxLink";
+    case DJL_EV_DJM_MIXER:           return "DjmMixer";
+    case DJL_EV_VU_METERS:           return "VuMeters";
     default:                         return "?";
     }
 }

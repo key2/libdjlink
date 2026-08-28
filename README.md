@@ -38,6 +38,8 @@ Verified against live hardware: 2 × `CDJ-3000X` (firmware 1.31) + `DJM-A9`.
 | **ANLZ `.DAT`/`.EXT`/`.2EX` walker** | **done, verified** (grid, cues, phrases, waveforms) |
 | **Beat-grid position interpolation** (pre-CDJ-3000 players) | **done, verified** (matches players' own beat numbers) |
 | **rekordbox LINK control channel** (7 undocumented 50002 kinds) | **done** (77/77 captured packets decode) |
+| **DJM-A9 / V10 mixer state (0x39) + VU meters (0x58) decoders** | **done** (full field/segment decode, unit-tested) |
+| **DJM bridge subscription** (0xF9 keepalive + 0x57 subscribe) | **built** to the reference recipe; our DJM-A9 receives it but sends no fader/VU back (see ARCHITECTURE.md 1.12) |
 | **Windows / macOS portability** | **Windows verified** under Wine incl. live rig; macOS written, uncompiled |
 | Tempo-master handoff dance, beat emission | partial |
 | Opus Quad / XDJ-AZ, Touch Audio PCM | not yet (Opus needs the hardware) |

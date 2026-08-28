@@ -94,6 +94,9 @@ size_t djl_build_status(uint8_t *buf, size_t cap, const djl_identity *id,
 size_t djl_build_media_query(uint8_t *buf, size_t cap, const djl_identity *id,
                              uint8_t target, uint8_t slot);
 size_t djl_build_sync_control(uint8_t *buf, size_t cap, const djl_identity *id, uint8_t s);
+/* DJM bridge: broadcast keepalive (50000) and per-DJM subscribe (50001). */
+size_t djl_build_bridge_keep_alive(uint8_t *buf, size_t cap, const djl_identity *id);
+size_t djl_build_bridge_subscribe(uint8_t *buf, size_t cap, const djl_identity *id);
 size_t djl_build_on_air(uint8_t *buf, size_t cap, const djl_identity *id,
                         uint8_t mask, bool six);
 size_t djl_build_fader_start(uint8_t *buf, size_t cap, const djl_identity *id,
@@ -196,6 +199,21 @@ struct djl_context {
     struct djl_meta_entry *meta_cache;   /* [64], heap to keep this struct lean */
     djl_provider_kind providers[DJL_MAX_PROVIDERS];
     size_t          provider_count;
+
+    /* DJM bridge (context.c). sock_bridge is an ephemeral-port send socket for
+     * the 0x57 subscribe, kept off the well-known ports some DJM firmware
+     * refuses to accept subscribes from. Timers gate the keepalive/subscribe
+     * cadence; bridge_since_ms delays the first subscribe until the DJM has
+     * seen a couple of bridge keepalives. The per-mixer caches are indexed by
+     * device number and written under ctx->lock by the I/O thread. */
+    djl_sock        sock_bridge;
+    uint64_t        next_bridge_ka;
+    uint64_t        next_bridge_sub;
+    uint64_t        bridge_since_ms;
+    /* Small per-mixer caches (a rig rarely has more than one DJM), each keyed
+     * by device number and written under ctx->lock by the I/O thread. */
+    struct { bool valid; uint8_t number; djl_djm_mixer m; } djm_mixer[4];
+    struct { bool valid; uint8_t number; djl_vu_meters v; } vu_meters[4];
 
     /* Bumped by the I/O thread whenever a player's media changes or the device
      * disappears, so the metadata worker knows to drop any NFS mount and parsed

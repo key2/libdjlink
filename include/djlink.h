@@ -50,11 +50,13 @@ DJL_API uint64_t djl_now_ms(void);
 #define DJL_PORT_AUDIO    50004
 
 #define DJL_MAGIC_LEN      10
-/* Version. In 0.x the MINOR is bumped for ABI-breaking changes and is part of
+/* Version. In 0.x the MINOR is bumped for ABI-affecting changes and is part of
  * the library soname, so a stale shared library cannot be loaded silently.
- * 0.2.0 grew djl_event from 200 to 256 bytes (djl_rb_link joined its union). */
+ * 0.2.0 grew djl_event from 200 to 256 bytes (djl_rb_link joined its union).
+ * 0.3.0 added the DJM bridge: new config fields, event kinds and decoders (the
+ * djl_event union did not grow, but djl_config did). */
 #define DJL_VERSION_MAJOR  0
-#define DJL_VERSION_MINOR  2
+#define DJL_VERSION_MINOR  3
 #define DJL_VERSION_PATCH  0
 
 #define DJL_NAME_LEN       0x14   /* 20 */
@@ -320,6 +322,83 @@ typedef struct {
 
 DJL_API djl_err djl_decode_mixer_status(const uint8_t *buf, size_t len, djl_mixer_status *out);
 
+/* ------------------------------------------------------------------ */
+/* DJM-A9 / DJM-V10 mixer state and VU meters (bridge only)            */
+/* ------------------------------------------------------------------ */
+
+/* One channel strip of a DJM. Every field is the raw 0..255 position the mixer
+ * reports for that knob/fader/button; a field the model lacks reads 0 (e.g. the
+ * DJM-900NXS2 has no compressor, lo-mid EQ, per-channel send or CUE B).
+ * Field map ported from SuperTimecodeConverter, cross-checked live on a
+ * DJM-A9. Offsets are per §1.12 of ARCHITECTURE.md. */
+typedef struct {
+    uint8_t input_src;   /* selected input source */
+    uint8_t trim;
+    uint8_t comp;        /* V10 compressor */
+    uint8_t eq_hi;
+    uint8_t eq_mid;
+    uint8_t eq_lo_mid;   /* V10 */
+    uint8_t eq_lo;
+    uint8_t color;       /* Sound Color FX knob */
+    uint8_t send;        /* V10 per-channel send */
+    uint8_t cue;         /* headphone CUE button */
+    uint8_t cue_b;       /* A9/V10 CUE B */
+    uint8_t fader;       /* channel fader */
+    uint8_t xf_assign;   /* crossfader assign: 0 A, 1 thru, 2 B (model-specific) */
+} djl_djm_channel;
+
+/* Full DJM state decoded from one 0x39 fader-status packet. */
+typedef struct {
+    uint8_t number;                 /* mixer device number (0x21+) */
+    char    name[DJL_NAME_LEN + 1];
+    uint8_t channels;               /* 4 or 6, from the model */
+    djl_djm_channel ch[6];
+
+    uint8_t crossfader, fader_curve, xf_curve;
+    uint8_t master_fader, master_cue, master_cue_b;
+    uint8_t isolator_on, isolator_hi, isolator_mid, isolator_lo;  /* hi/mid/lo V10 */
+    uint8_t booth, booth_eq_hi, booth_eq_lo, booth_eq;
+
+    uint8_t hp_cue_link,  hp_mixing,  hp_level;
+    uint8_t hp_cue_link_b, hp_mixing_b, hp_level_b;               /* A9/V10 */
+
+    /* Beat FX. beat_fx_select and beat_fx_assign are model-specific enums;
+     * exposed as raw bytes rather than a normalised table. */
+    uint8_t fx_freq_lo, fx_freq_mid, fx_freq_hi;
+    uint8_t beat_fx_select, beat_fx_assign, beat_fx_level, beat_fx_on;
+    uint8_t multi_io_select, multi_io_level, send_return;         /* A9/V10 */
+
+    uint8_t color_fx_select, color_fx_param;
+    uint8_t send_ext1, send_ext2;                                 /* A9/V10 */
+    uint8_t mic_eq_hi, mic_eq_lo;
+    uint8_t filter_lpf, filter_hpf, filter_reso;                  /* V10 */
+} djl_djm_mixer;
+
+/* Decode a 0x39 DJM fader-status packet. channels selects how many channel
+ * strips are meaningful for the model (4 for most DJMs, 6 for the V10); pass 0
+ * to default to 4. The packet layout is identical across models, so the count
+ * only bounds how many ch[] entries are reported as real. */
+DJL_API djl_err djl_decode_djm_mixer(const uint8_t *buf, size_t len,
+                                     uint8_t channels, djl_djm_mixer *out);
+
+#define DJL_VU_SEGMENTS 15   /* per-meter ladder height on the wire */
+
+/* DJM VU meters from one 0x58 packet. Each meter is a 15-segment ladder
+ * (0 = silence, 0x7fff = clip); peak is the max segment, handy for a single
+ * bar, while the raw ladders drive a segmented display. */
+typedef struct {
+    uint8_t  number;
+    char     name[DJL_NAME_LEN + 1];
+    uint8_t  channels;                     /* 4 or 6 */
+    uint16_t channel_peak[6];
+    uint16_t master_peak[2];               /* L, R */
+    uint16_t channel_seg[6][DJL_VU_SEGMENTS];
+    uint16_t master_seg[2][DJL_VU_SEGMENTS];
+} djl_vu_meters;
+
+DJL_API djl_err djl_decode_vu_meters(const uint8_t *buf, size_t len,
+                                     uint8_t channels, djl_vu_meters *out);
+
 typedef struct {
     uint8_t  number;
     char     name[DJL_NAME_LEN + 1];
@@ -436,6 +515,14 @@ typedef struct {
      * media can turn it off and still get everything dbserver offers. Ignored
      * when observe_only is set, which suppresses all outbound traffic. */
     bool              allow_media_access;
+    /* Act as a Pioneer "Pro DJ Link Bridge" toward DJM mixers, in addition to
+     * the normal virtual-CDJ presence. A DJM only streams its fader-status
+     * (0x39) and VU-meter (0x58) packets to a device that has announced the
+     * bridge identity and subscribed, so this must be on to receive
+     * DJL_EV_DJM_MIXER / DJL_EV_VU_METERS. Off by default: it adds a second
+     * announced identity to the network and is only useful when a DJM is
+     * present. Ignored under observe_only. */
+    bool              djm_bridge;
     djl_log_fn        log;
     void             *log_ud;
     djl_log_level     log_level;
@@ -477,6 +564,12 @@ DJL_API djl_err djl_device_by_number(djl_context *ctx, uint8_t number, djl_devic
 
 /* Latest cached status per player, or DJL_ERR_NOT_FOUND. */
 DJL_API djl_err djl_cdj_status_for(djl_context *ctx, uint8_t number, djl_cdj_status *out);
+
+/* Latest cached DJM state / VU for a mixer, populated while cfg.djm_bridge is
+ * on. The VU event carries only peaks; djl_vu_meters_for returns the full
+ * 15-segment ladders too. Both return DJL_ERR_NOT_FOUND if nothing arrived. */
+DJL_API djl_err djl_djm_mixer_for(djl_context *ctx, uint8_t number, djl_djm_mixer *out);
+DJL_API djl_err djl_vu_meters_for(djl_context *ctx, uint8_t number, djl_vu_meters *out);
 DJL_API int     djl_tempo_master(djl_context *ctx);
 DJL_API double  djl_master_tempo(djl_context *ctx);
 
@@ -533,6 +626,8 @@ typedef enum {
     DJL_EV_SONG_STRUCTURE,
     DJL_EV_UNKNOWN_PACKET,
     DJL_EV_REKORDBOX_LINK,
+    DJL_EV_DJM_MIXER,      /* 0x39 fader status; carries the full djl_djm_mixer */
+    DJL_EV_VU_METERS,      /* 0x58 VU; carries peaks, full ladders via pull */
     DJL_EV__COUNT
 } djl_event_kind;
 
@@ -582,6 +677,15 @@ typedef struct {
             uint8_t  bytes[64];   /* first 64 bytes for research */
         } unknown;
         djl_rb_link rb_link;
+        djl_djm_mixer djm_mixer;
+        /* VU events carry only the peaks (cheap at ~30 Hz); call
+         * djl_vu_meters_for for the raw 15-segment ladders. */
+        struct {
+            uint8_t  number;
+            uint8_t  channels;
+            uint16_t channel_peak[6];
+            uint16_t master_peak[2];
+        } vu_peaks;
     } u;
 } djl_event;
 

@@ -571,6 +571,60 @@ from context.
   for reading CDJ USBs. This is the single largest capability gap surfaced by
   the capture.
 
+### 1.12 DJM mixer state (`0x39`) / VU meters (`0x58`) and the bridge (2026-08-28)
+
+A DJM does not broadcast its fader positions or VU meters. It unicasts them only
+to a device that has announced the Pioneer "Pro DJ Link Bridge" identity and
+subscribed. libdjlink implements all three parts; the decoders are complete and
+tested, the subscription is implemented to the reference recipe, but the live
+DJM-A9 on our rig does not yet honour it (see the finding below).
+
+**`0x39` fader status** (unicast, ~on change, usually to port 50002; 248 B on
+both the DJM-900NXS2 and V10). Every field is a single raw byte, 0 where the
+model lacks that control. Field map ported from SuperTimecodeConverter:
+
+- Per-channel strips are `0x18` apart: CH1-CH4 at `0x24`/`0x3c`/`0x54`/`0x6c`,
+  and on the V10 CH5/CH6 at `0x84`/`0x9c`. Within a strip: `+0` input source,
+  `+1` trim, `+2` compressor (V10), `+3..+6` EQ hi/mid/lo-mid(V10)/lo, `+7`
+  colour, `+8` send (V10), `+9` CUE, `+10` CUE B, `+11` fader, `+12` xfader
+  assign.
+- Master/crossfader at `0xb4`-`0xc1` (crossfader, fader curve, xf curve, master
+  fader, master CUE/CUE B, isolator on/hi/mid/lo, booth, booth EQ hi/lo).
+- Headphones at `0xc4`/`0xc5` and `0xe3`-`0xe7`; booth-EQ button at `0xe5`.
+- Beat FX at `0xc6`-`0xcf`; Color FX / external sends at `0xdb`-`0xe2`; mic EQ
+  at `0xd6`/`0xd7`; filter (V10) at `0xd8`-`0xda`.
+
+**`0x58` VU meters** (unicast, ~30 Hz, port 50001; ≥ 0x176 B). Each meter is 15
+big-endian `u16` segments (0 silence, `0x7fff` clip) on a `0x3c` stride. 4-ch
+layout: CH1-CH4 at `0x2c`/`0x68`/`0xa4`/`0xe0`, Master L/R at `0x11c`/`0x158`;
+the V10 appends CH5/CH6 at `0x194`/`0x1d0`.
+
+**The bridge subscription.** To be sent fader/VU data, a device must:
+
+1. Broadcast a 54-byte `0x06` keepalive with player byte `0xF9`, subtype `0x01`
+   (bridge), byte `0x30`=`0x04` (the A9 rejects `0x03`). Device type `0x01`.
+2. Unicast a 40-byte `0x57` subscribe to the DJM's port 50001 from an ephemeral
+   source port, bitmask `0x87` (faders + VU), after the DJM has seen a couple of
+   keepalives.
+
+Crucially, the DJM must see **only one** identity from our IP/MAC: if it also
+sees a virtual-CDJ keepalive it treats them as conflicting and refuses faders.
+libdjlink therefore, in bridge mode, unicasts its virtual-CDJ keepalive to CDJs
+only and broadcasts just the bridge identity.
+
+**Live finding (2026-08-28), unresolved.** Against DJM-A9 firmware (model
+`0xb1`, proto `0x02`) at `169.254.7`-net, a faithful, byte-checked reproduction
+of the entire recipe — bridge join (`0x0a`+`0x02`, subtype `0x01`), the `0xF9`
+keepalive, the 95-byte "PRODJLINK BRIDGE" keepalive, subscribe with both `0x87`
+and `0xFE` to ports 50001/50002 from both ephemeral and well-known source ports,
+with no competing bridge on the network — did **not** elicit a single `0x39` or
+`0x58`. Our subscribes are confirmed on the wire reaching the A9; the A9 emits
+only its normal `0x06` keepalive and `0x03` on-air broadcast. This points to
+either a device-side gate on this A9/firmware or a detail present only in a real
+Pioneer Bridge capture (SuperTimecodeConverter was validated against one we do
+not have). The decoders and subscription ship regardless: they are correct
+against the documented layout and will produce data the moment a DJM sends it.
+
 ---
 
 ## 2. Layered architecture
@@ -1411,8 +1465,9 @@ live CDJ-3000X / DJM-A9 rig; **[built]** implemented, not yet hardware-verified;
 | rekordbox link UDP control (`0x11`,`0x16`,`0x30`,`0x31`,`0x46`,`0x47`,`0x80`) | **[done]** all seven classified and decoded (subtype/device/len_r + per-kind payloads, host name UTF-16**BE**); 77/77 capture packets decode | measured first-hand, §1.11 |
 | Touch Audio (`0x1e`/`0x1f`/`0x20`) | **[built]** timing rx decoded (122k pkts seen); PCM **[todo]** | complete |
 | Streaming tracks (Beatport LINK, Cloud Direct Play) | metadata + waveforms; no grid/cues | protocol-limited |
-| DJM-A9 mixer state (`0x39`) per-channel | expose decoded fields, raw block for the rest | master/FX block **undecoded** |
-| A9 VU stream (`0x58`) | expose raw | **hypothesis only** |
+| DJM-A9 / V10 mixer state (`0x39`) | **[done]** full field decoder (all channels, master, FX, filter), unit-tested; **[built]** bridge subscription, but our A9 does not yet emit it (§1.12) | decoder complete; live elicitation blocked |
+| DJM VU stream (`0x58`) | **[done]** 15-segment ladders + peaks decoded, unit-tested; same bridge caveat | decoder complete; live elicitation blocked |
+| DJM bridge persona (`0xF9` keepalive + `0x57` subscribe) | **[built]** to the reference recipe; DJM-A9 receives it but sends no fader/VU back — needs a device setting or a real Pioneer Bridge capture | measured 2026-08-28, §1.12 |
 | Stagehand command surface (`0x3a`, `0x6b`, `0x07`) | implement the verified opcodes | partially decoded |
 | CDJ-3000 `0x0b` unicast round-robin telemetry | expose raw sub-streams | 8 sub-types, **semantics unknown** |
 | `0x3d` track metadata push (2572 B) | decode the ~150 B that is known, expose raw | **mostly undecoded** |

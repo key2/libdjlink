@@ -137,6 +137,58 @@ size_t djl_build_keep_alive(uint8_t *buf, size_t cap, const djl_identity *id)
     return total;
 }
 
+/* Pro DJ Link Bridge keepalive (0x06, 54 bytes, broadcast on 50000).
+ *
+ * A DJM only starts streaming its fader-status (0x39) and VU (0x58) once it has
+ * seen this bridge identity broadcast and then received a subscribe (below).
+ * The DJM-A9 is strict: player byte must be 0xF9 and byte 0x30 must be 0x04, or
+ * it silently ignores the subscribe (SuperTimecodeConverter, verified live).
+ * Device type 0x01 marks us as a bridge/lighting controller, distinct from our
+ * virtual-CDJ keepalive, so both identities can coexist from one host. */
+#define DJL_BRIDGE_PLAYER 0xF9
+
+size_t djl_build_bridge_keep_alive(uint8_t *buf, size_t cap, const djl_identity *id)
+{
+    const size_t total = 0x36;
+    if (cap < total) return 0;
+    memset(buf, 0, total);
+    if (!hdr_announce(buf, cap, 0x06, 0x00, id)) return 0;
+    buf[0x20] = 0x01;
+    buf[0x21] = 0x01;               /* subtype: bridge */
+    put_be16(buf, 0x22, (uint16_t)total);
+    buf[0x24] = DJL_BRIDGE_PLAYER;
+    buf[0x25] = 0x00;
+    memcpy(buf + 0x26, id->mac, 6);
+    memcpy(buf + 0x2c, id->ip, 4);
+    buf[0x30] = 0x04;              /* A9 requires 0x04 here, not 0x03 */
+    buf[0x34] = 0x05;
+    buf[0x35] = 0x20;
+    return total;
+}
+
+/* Bridge subscribe (0x57, 40 bytes, unicast to a DJM's port 50001).
+ *
+ * Byte 0x21 is the subscription bitmask; 0x87 requests faders + VU (the value
+ * the reference bridge uses on non-Apple hosts). Should be sent from an
+ * ephemeral source port, not 50001/50002, because some DJM firmware ignores a
+ * subscribe whose source port matches a port it also sends data on. */
+#define DJL_BRIDGE_SUB_MASK 0x87
+
+size_t djl_build_bridge_subscribe(uint8_t *buf, size_t cap, const djl_identity *id)
+{
+    const size_t total = 0x28;
+    if (cap < total) return 0;
+    memset(buf, 0, total);
+    if (!hdr_status(buf, cap, 0x57, id)) return 0;   /* name at 0x0b */
+    buf[0x1f] = 0x01;
+    buf[0x20] = 0x00;
+    buf[0x21] = DJL_BRIDGE_SUB_MASK;
+    buf[0x22] = 0x00;
+    buf[0x23] = 0x04;             /* subtype */
+    buf[0x24] = 0x01;             /* subscribe = 1 */
+    return total;
+}
+
 size_t djl_build_number_in_use(uint8_t *buf, size_t cap, const djl_identity *id,
                                uint8_t defended, const uint8_t ip[4])
 {

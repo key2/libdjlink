@@ -21,6 +21,8 @@ void djl_test_nfs(void);
 void djl_test_position(void);
 /* Implemented in test_rblink.c: rekordbox LINK control channel. */
 void djl_test_rblink(void);
+/* Implemented in test_djm.c: DJM mixer state + VU meters. */
+void djl_test_djm(void);
 
 #define CHECK(cond, ...) do {                            \
     checks++;                                            \
@@ -679,6 +681,7 @@ int main(void)
     djl_test_nfs();
     djl_test_position();
     djl_test_rblink();
+    djl_test_djm();
 
     printf("\n%d checks, %d failure(s)\n", checks, failures);
     return failures ? 1 : 0;
