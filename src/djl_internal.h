@@ -106,9 +106,9 @@ size_t djl_build_stagehand_claim(uint8_t *buf, size_t cap, const djl_identity *i
 size_t djl_build_stagehand_keep_alive(uint8_t *buf, size_t cap, const djl_identity *id);
 /* Stagehand remote control. transport -> port 50001, pref-write -> 50002. */
 size_t djl_build_transport(uint8_t *buf, size_t cap, const djl_identity *id,
-                           uint8_t target, uint8_t op, bool press, uint8_t corr);
+                           uint8_t op, bool press, uint8_t corr);
 size_t djl_build_pref_write(uint8_t *buf, size_t cap, const djl_identity *id,
-                            uint8_t target, uint8_t on_air, uint8_t quantize);
+                            uint8_t on_air, uint8_t quantize);
 size_t djl_build_on_air(uint8_t *buf, size_t cap, const djl_identity *id,
                         uint8_t mask, bool six);
 size_t djl_build_fader_start(uint8_t *buf, size_t cap, const djl_identity *id,

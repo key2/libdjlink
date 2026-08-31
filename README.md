@@ -41,7 +41,7 @@ Verified against live hardware: 2 × `CDJ-3000X` (firmware 1.31) + `DJM-A9`.
 | **rekordbox LINK control channel** (7 undocumented 50002 kinds) | **done** (77/77 captured packets decode) |
 | **DJM-A9 / V10 mixer state (0x39) + VU meters (0x58) decoders** | **done** (full field/segment decode, unit-tested) |
 | **Stagehand persona** (virtual iPad: type 0x05, model 0x20) | **built**, golden-vector tested, and **proven byte-for-byte equal to the reference on the wire** — but this DJM-A9 still pushes no 0x39/0x58, so the block is a device-side gate, not our code (ARCHITECTURE.md 1.14) |
-| **CDJ remote control** (transport 0x07, preference write 0x6b) | **built** — `djl_transport_*` (play/pause/skip/seek), `djl_write_pref_*` (on-air, quantize) |
+| **CDJ remote control** (transport 0x07, preference write 0x6b) | **built** — `djl_transport_*` (play/pause/skip/seek), `djl_write_pref_*` (on-air, quantize), byte-exact to alphatheta-connect; send path verified live, but this rig's CDJ-3000X doesn't act on them (device-side command gate, ARCHITECTURE.md 1.14) |
 | **Streaming-source detection** (Beatport / Direct Play / Cloud Direct Play) | **done** (`djl_streaming_source_of`, unit-tested) |
 | **DJM bridge subscription** (0xF9 keepalive + 0x57 subscribe) | **built**; superseded by the Stagehand persona, same A9 gate (ARCHITECTURE.md 1.12/1.14) |
 | **Windows / macOS portability** | **Windows verified** under Wine incl. live rig; macOS written, uncompiled |
@@ -100,11 +100,13 @@ djl_write_pref_on_air(ctx, player, true);   /* toggle the on-air display */
 djl_write_pref_quantize(ctx, player, 1);    /* quantize index (0=1 beat, 1=1/2, ...) */
 ```
 
-The persona is implemented to the dysentery `stagehand.adoc` byte map and was
-proven byte-for-byte identical on the wire to the reference `alphatheta-connect`.
-On this rig's DJM-A9 neither implementation elicits any `0x39`/`0x58`: the mixer
-gates the push (a firmware/Utility setting), so this is device-dependent — see
-`ARCHITECTURE.md` §1.14.
+The persona is byte-for-byte identical on the wire to `alphatheta-connect` and is
+accepted by the players (they unicast their monitor stream to it); the DJM-A9 was
+even captured pushing real `0x39` fader state once. But eliciting the DJM stream
+and getting the CDJ to *act* on transport/pref commands are both gated
+device-side on this rig (an opaque single-peer election). Command byte offsets
+follow the reference (`0x2c`/`0x2e`), not dysentery's `0x2b`/`0x2d`. Full
+analysis: `ARCHITECTURE.md` §1.14.
 
 ## NFS tool — read a player's USB/SD directly
 

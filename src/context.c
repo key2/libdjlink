@@ -1520,7 +1520,7 @@ djl_err djl_transport(djl_context *ctx, uint8_t player, djl_transport_op op, boo
     djl_err e = need_online(ctx);
     if (e != DJL_OK) return e;
     uint8_t buf[DJL_MAX_PACKET];
-    size_t n = djl_build_transport(buf, sizeof buf, &ctx->id, player,
+    size_t n = djl_build_transport(buf, sizeof buf, &ctx->id,
                                    (uint8_t)op, press, ctx->sh_corr);
     return sh_send(ctx, player, &ctx->sock_beat, DJL_PORT_BEAT, buf, n);
 }
@@ -1557,7 +1557,7 @@ djl_err djl_write_pref_on_air(djl_context *ctx, uint8_t player, bool on)
     djl_err e = need_online(ctx);
     if (e != DJL_OK) return e;
     uint8_t buf[DJL_MAX_PACKET];
-    size_t n = djl_build_pref_write(buf, sizeof buf, &ctx->id, player,
+    size_t n = djl_build_pref_write(buf, sizeof buf, &ctx->id,
                                     on ? 0x81 : 0x80, 0x00);
     return sh_send(ctx, player, &ctx->sock_status, DJL_PORT_STATUS, buf, n);
 }
@@ -1568,7 +1568,7 @@ djl_err djl_write_pref_quantize(djl_context *ctx, uint8_t player, uint8_t enum_i
     if (e != DJL_OK) return e;
     if (enum_index > 0x7f) return DJL_ERR_INVAL;
     uint8_t buf[DJL_MAX_PACKET];
-    size_t n = djl_build_pref_write(buf, sizeof buf, &ctx->id, player,
+    size_t n = djl_build_pref_write(buf, sizeof buf, &ctx->id,
                                     0x00, (uint8_t)(0x80 | enum_index));
     return sh_send(ctx, player, &ctx->sock_status, DJL_PORT_STATUS, buf, n);
 }

@@ -726,11 +726,19 @@ dysentery `stagehand.adoc` single-control captures:
   `0x22`, write flag `0x01` at `0x24`, **on-air display at `0x2c`** (`0x80` off,
   `0x81` on), **quantize at `0x3c`** (`0x80 | index`).
 
+**Remote-control byte map (corrected).** dysentery's `stagehand.adoc` placed the
+`0x07` action byte at `0x2b` and press/release at `0x2d`; driving a real CDJ
+showed that layout has no effect, and the working reference `alphatheta-connect`
+in fact uses **`0x2c`** (action) and **`0x2e`** (press/release), with **no target
+device number in the packet** (the deck is addressed by the unicast destination
+IP) and the `0x6b` pref-write forcing the last name byte (`0x1e`) to `0x03`.
+libdjlink follows the reference exactly.
+
 **Live findings (2026-08-31).** The persona was captured off the wire and
 confirmed byte-for-byte correct (announce/claim/keep-alive as above), and the
 remote-control send path was verified too: `djl_write_pref_on_air` puts a 124-byte
 `0x6b` on 50002 and `djl_transport_play` puts the paired 56-byte `0x07` (plus a
-single `0x07` for pause) on 50001, all correctly addressed to the target CDJ.
+single `0x07` for pause) on 50001.
 
 Four distinct results, in order of confidence:
 
@@ -738,11 +746,21 @@ Four distinct results, in order of confidence:
    reference `alphatheta-connect` in `connectMethod: 'stagehand'` against the same
    rig produces the identical on-wire join to libdjlink's, and (see below) the
    identical DJM behaviour. Our implementation is not the variable.
-2. **AlphaTheta gear does accept the persona.** The **CDJ-3000X reliably serves
-   it**: as soon as libdjlink is online as Stagehand, each CDJ unicasts its dense
-   monitor stream to us — ~30/s of the 68-byte `0x0b` telemetry and ~4/s of `0x0a`
-   status (measured 347 + 52 in a 12 s window). So the persona is genuinely
-   recognised as a Stagehand peer by the players.
+2. **AlphaTheta gear does accept the persona.** The **CDJ-3000X serves it**: while
+   libdjlink is online as Stagehand, each CDJ unicasts its dense monitor stream to
+   us — ~30/s of the 68-byte `0x0b` telemetry and ~4/s of `0x0a` status (measured
+   347 + 52 in a 12 s window). So the persona is genuinely recognised as a
+   Stagehand peer. (Some of the unicast `0x0a` status uses the beat-style framing
+   with the name at `0x0b`, which the broadcast-form `djl_decode_cdj_status`
+   doesn't parse; the players also broadcast the ordinary status which decodes
+   normally, so this is a minor stagehand-mode edge case, noted for completeness.)
+   **However, the CDJ does not act on our remote-control commands.** Driving a
+   paused CDJ-3000X (track loaded) with play / pause / skip taps — reference-exact
+   `0x07`, full press+release — left the deck paused throughout, exactly like the
+   A9's push: the gear accepts the persona and serves data, but gates *acting* on
+   a peer's commands (very likely the same single-peer election, see §1.14.3).
+   Our command bytes are correct on the wire; whether the device obeys is
+   device-side.
 3. **The DJM-A9 *does* push `0x39` — decoder now validated on real bytes — but
    the trigger is opaque.** In one session the A9 unicast **147** real `0x39`
    fader-status packets (~4 Hz) plus its `0x6a` heartbeat (120×) and a 164-byte
@@ -1626,7 +1644,7 @@ live CDJ-3000X / DJM-A9 rig; **[built]** implemented, not yet hardware-verified;
 | DJM VU stream (`0x58`) | **[done]** 15-segment ladders + peaks decoded, unit-tested; never seen live (same mixer gate) | decoder complete; not seen live |
 | Stagehand persona (`0x0a`/`0x02`/`0x06`, type `0x05`) | **[done]** implemented, golden-vector tested, **proven byte-for-byte equal to the reference on the wire**, and **accepted by the CDJ-3000X** (which unicasts its `0x0b`/`0x0a` monitor stream to us); the A9's `0x39` push is intermittent (§1.14) | persona correct and accepted; A9 push flaky |
 | DJM bridge persona (`0xF9` keepalive + `0x57` subscribe) | **[built]** to the reference recipe; superseded by the Stagehand persona (§1.12, §1.14) | measured 2026-08-28 |
-| CDJ remote control: transport (`0x07`) + preference write (`0x6b`) | **[done]** `djl_transport_*` (play/pause/skip/seek) and `djl_write_pref_*` (on-air, quantize); send path verified live on the wire (correct sizes/ports/target) | opcodes from first-party captures |
+| CDJ remote control: transport (`0x07`) + preference write (`0x6b`) | **[built]** `djl_transport_*` (play/pause/skip/seek) and `djl_write_pref_*` (on-air, quantize), byte-exact to the reference (`0x2c`/`0x2e` action/press), send path verified live; the CDJ-3000X does not *act* on them on this rig — device-side command gate, §1.14 | offsets corrected to alphatheta-connect |
 | CDJ-3000 `0x0b` unicast round-robin telemetry | expose raw sub-streams | 8 sub-types, **semantics unknown** |
 | `0x3d` track metadata push (2572 B) | decode the ~150 B that is known, expose raw | **mostly undecoded** |
 | `0x56` 316-byte reply | expose raw | **likely AES-CBC, key unknown** |

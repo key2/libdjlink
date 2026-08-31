@@ -268,32 +268,36 @@ size_t djl_build_stagehand_keep_alive(uint8_t *buf, size_t cap, const djl_identi
  * at the unicast peer-marker slot 0x1e, mirroring the Stagehand->A9 command
  * frame. */
 
+/* The target CDJ is addressed by the unicast destination IP, not by any field
+ * in the packet (the reference alphatheta-connect carries no device number here).
+ * Offsets match alphatheta-connect exactly: dysentery's stagehand.adoc listed the
+ * action one byte lower, but the working reference and live testing put it at
+ * 0x2c / 0x2e. */
 size_t djl_build_transport(uint8_t *buf, size_t cap, const djl_identity *id,
-                           uint8_t target, uint8_t op, bool press, uint8_t corr)
+                           uint8_t op, bool press, uint8_t corr)
 {
     const size_t total = 0x38;          /* 56 bytes */
     if (cap < total) return 0;
     memset(buf, 0, total);
     if (!hdr_status(buf, cap, 0x07, id)) return 0;   /* name at 0x0b */
-    buf[0x1e] = target;                 /* addressed CDJ device number */
     buf[0x1f] = 0x01;
     buf[0x20] = DJL_STAGEHAND_PROTO;    /* 0x03 */
     buf[0x21] = corr;                   /* per-session correlation / view hash */
     put_be16(buf, 0x22, 0x0030);        /* len_r: 48 bytes follow */
     buf[0x28] = DJL_STAGEHAND_SYMBOL;   /* 0x3a sub-id */
-    buf[0x2b] = op;                     /* action byte */
-    buf[0x2d] = press ? 0x01 : 0x00;    /* press / release */
+    buf[0x2c] = op;                     /* action byte */
+    buf[0x2e] = press ? 0x01 : 0x00;    /* press / release */
     return total;
 }
 
 size_t djl_build_pref_write(uint8_t *buf, size_t cap, const djl_identity *id,
-                            uint8_t target, uint8_t on_air, uint8_t quantize)
+                            uint8_t on_air, uint8_t quantize)
 {
     const size_t total = 0x7c;          /* 124 bytes */
     if (cap < total) return 0;
     memset(buf, 0, total);
     if (!hdr_status(buf, cap, 0x6b, id)) return 0;   /* name at 0x0b */
-    buf[0x1e] = target;                 /* addressed CDJ device number */
+    buf[0x1e] = DJL_STAGEHAND_PROTO;    /* 0x03: reference forces the last name byte */
     buf[0x1f] = 0x01;
     buf[0x20] = DJL_STAGEHAND_PROTO;    /* 0x03 */
     buf[0x21] = DJL_STAGEHAND_SYMBOL;   /* 0x3a sub-id */

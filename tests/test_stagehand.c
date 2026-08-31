@@ -146,27 +146,26 @@ static void test_transport_packet(void)
 {
     djl_identity id = sh_id();
     uint8_t buf[64];
-    size_t n = djl_build_transport(buf, sizeof buf, &id, 2 /*target*/,
+    size_t n = djl_build_transport(buf, sizeof buf, &id,
                                    0x0f /*play*/, true, 0x5a /*corr*/);
     CHECK_EQ_U(n, 0x38);                 /* 56 bytes */
     CHECK(djl_wire_has_magic(buf, n), "magic");
     CHECK_EQ_U(buf[0x0a], 0x07);         /* kind */
     CHECK(memcmp(buf + 0x0b, "Stagehand", 9) == 0, "name at 0x0b");
-    CHECK_EQ_U(buf[0x1e], 2);            /* target device number */
     CHECK_EQ_U(buf[0x1f], 0x01);
     CHECK_EQ_U(buf[0x20], 0x03);         /* proto marker */
     CHECK_EQ_U(buf[0x21], 0x5a);         /* correlation byte */
     CHECK_EQ_U(buf[0x22], 0x00);         /* len_r hi */
     CHECK_EQ_U(buf[0x23], 0x30);         /* len_r lo */
     CHECK_EQ_U(buf[0x28], 0x3a);         /* sub-id */
-    CHECK_EQ_U(buf[0x2b], 0x0f);         /* action */
-    CHECK_EQ_U(buf[0x2d], 0x01);         /* press */
+    CHECK_EQ_U(buf[0x2c], 0x0f);         /* action (alphatheta-connect offset) */
+    CHECK_EQ_U(buf[0x2e], 0x01);         /* press */
 
-    n = djl_build_transport(buf, sizeof buf, &id, 2, 0x14, false, 0x5a);
-    CHECK_EQ_U(buf[0x2b], 0x14);
-    CHECK_EQ_U(buf[0x2d], 0x00);         /* release */
+    n = djl_build_transport(buf, sizeof buf, &id, 0x14, false, 0x5a);
+    CHECK_EQ_U(buf[0x2c], 0x14);
+    CHECK_EQ_U(buf[0x2e], 0x00);         /* release */
 
-    CHECK_EQ_U(djl_build_transport(buf, 10, &id, 2, 0x0f, true, 0), 0);
+    CHECK_EQ_U(djl_build_transport(buf, 10, &id, 0x0f, true, 0), 0);
 }
 
 static void test_pref_write_packet(void)
@@ -175,13 +174,12 @@ static void test_pref_write_packet(void)
     uint8_t buf[160];
 
     /* On-air ON. */
-    size_t n = djl_build_pref_write(buf, sizeof buf, &id, 1 /*target*/,
-                                    0x81 /*on*/, 0x00);
+    size_t n = djl_build_pref_write(buf, sizeof buf, &id, 0x81 /*on*/, 0x00);
     CHECK_EQ_U(n, 0x7c);                 /* 124 bytes */
     CHECK(djl_wire_has_magic(buf, n), "magic");
     CHECK_EQ_U(buf[0x0a], 0x6b);
     CHECK(memcmp(buf + 0x0b, "Stagehand", 9) == 0, "name at 0x0b");
-    CHECK_EQ_U(buf[0x1e], 1);            /* target */
+    CHECK_EQ_U(buf[0x1e], 0x03);         /* reference forces last name byte to 0x03 */
     CHECK_EQ_U(buf[0x1f], 0x01);
     CHECK_EQ_U(buf[0x20], 0x03);
     CHECK_EQ_U(buf[0x21], 0x3a);         /* sub-id */
@@ -192,16 +190,16 @@ static void test_pref_write_packet(void)
     CHECK_EQ_U(buf[0x3c], 0x00);         /* quantize untouched */
 
     /* On-air OFF. */
-    n = djl_build_pref_write(buf, sizeof buf, &id, 1, 0x80, 0x00);
+    n = djl_build_pref_write(buf, sizeof buf, &id, 0x80, 0x00);
     CHECK_EQ_U(buf[0x2c], 0x80);
 
     /* Quantize index 2 (=1/4): wire value 0x82. */
-    n = djl_build_pref_write(buf, sizeof buf, &id, 1, 0x00, 0x82);
+    n = djl_build_pref_write(buf, sizeof buf, &id, 0x00, 0x82);
     CHECK_EQ_U(buf[0x2c], 0x00);         /* on-air untouched */
     CHECK_EQ_U(buf[0x3c], 0x82);
     (void)n;
 
-    CHECK_EQ_U(djl_build_pref_write(buf, 20, &id, 1, 0x81, 0), 0);
+    CHECK_EQ_U(djl_build_pref_write(buf, 20, &id, 0x81, 0), 0);
 }
 
 static void test_streaming_source(void)
