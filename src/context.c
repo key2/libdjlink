@@ -529,12 +529,35 @@ static uint8_t djm_channels(djl_context *ctx, uint8_t number)
     return 4;
 }
 
+/* The 0x39/0x58 packets a DJM unicasts to a Stagehand peer carry a length /
+ * state-counter byte at 0x21, NOT the mixer's device number (verified live: a
+ * real DJM-A9 push decoded with 0x21 = 0xa1, while the mixer is device 0x21=33).
+ * The bridge form does put the number there. Resolve the authoritative number
+ * from the roster by matching the packet's name field, falling back to the sole
+ * mixer, then to the raw byte. Caller must hold ctx->lock. */
+static uint8_t resolve_mixer_number(djl_context *ctx, const char *name, uint8_t raw)
+{
+    djl_slot_entry *only = NULL;
+    size_t mixers = 0;
+    for (size_t i = 0; i < DJL_MAX_DEVICES; i++) {
+        if (!ctx->devices[i].used || !ctx->devices[i].info.is_mixer) continue;
+        mixers++;
+        only = &ctx->devices[i];
+        if (name && name[0] && strcmp(ctx->devices[i].info.name, name) == 0)
+            return ctx->devices[i].info.number;
+    }
+    if (mixers == 1 && only) return only->info.number;
+    return raw;
+}
+
 /* Decode a 0x39 fader-status packet, cache it per mixer, and emit it. */
 static void handle_djm_mixer(djl_context *ctx, const uint8_t *buf, size_t len, uint64_t now)
 {
     uint8_t number = (len > 0x21) ? buf[0x21] : 0;
     djl_djm_mixer m;
     if (djl_decode_djm_mixer(buf, len, djm_channels(ctx, number), &m) != DJL_OK) return;
+    /* Override the raw 0x21 byte with the mixer's true roster number. */
+    m.number = resolve_mixer_number(ctx, m.name, m.number);
 
     djl_slot_entry *e = roster_find(ctx, m.number);
     if (e) e->info.last_seen_ms = now - ctx->t0;
@@ -564,6 +587,8 @@ static void handle_vu_meters(djl_context *ctx, const uint8_t *buf, size_t len, u
     uint8_t number = (len > 0x21) ? buf[0x21] : 0;
     djl_vu_meters v;
     if (djl_decode_vu_meters(buf, len, djm_channels(ctx, number), &v) != DJL_OK) return;
+    /* Same 0x21 caveat as the 0x39 form; resolve the real mixer number. */
+    v.number = resolve_mixer_number(ctx, v.name, v.number);
 
     djl_slot_entry *e = roster_find(ctx, v.number);
     if (e) e->info.last_seen_ms = now - ctx->t0;
