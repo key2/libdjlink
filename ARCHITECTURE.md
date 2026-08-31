@@ -743,32 +743,41 @@ Four distinct results, in order of confidence:
    monitor stream to us — ~30/s of the 68-byte `0x0b` telemetry and ~4/s of `0x0a`
    status (measured 347 + 52 in a 12 s window). So the persona is genuinely
    recognised as a Stagehand peer by the players.
-3. **The DJM-A9 push is gated and, at best, intermittent.** Across most sessions
-   (including a 55 s run and the reference's own run) the A9 emitted **only** its
-   normal `0x03` on-air and `0x06` keep-alive broadcasts — no `0x39`/`0x58`, no
-   unicast, no ARP for us. In **one** session, however, the A9 *did* unicast real
-   `0x39` fader-status at ~4 Hz (57 packets) with entirely plausible values
-   (crossfader `0x7a`, EQ at unity `0x80`, channel faders `0x00`/`0xff`, matching
-   dysentery's description of this exact unit), which our decoder read correctly.
-   That window could not be reproduced. So this A9 *can* serve `0x39` but does so
-   unreliably — a device-side gate (a Utility/PRO&nbsp;DJ&nbsp;LINK setting, a
-   firmware condition, or a state that only sometimes elects to push), not a
-   protocol error in libdjlink. `0x58` VU was never seen.
+3. **The DJM-A9 *does* push `0x39` — decoder now validated on real bytes — but
+   the trigger is opaque.** In one session the A9 unicast **147** real `0x39`
+   fader-status packets (~4 Hz) plus its `0x6a` heartbeat (120×) and a 164-byte
+   device-table `0x06` — 286 unicast packets to our persona in all. The `0x39`
+   payload decoded cleanly and matches this exact unit: crossfader `0x7a`
+   (≈centre), EQ at unity `0x80`, CH1 fader `0xff`, CH2 fader `0x00` with the
+   distinctive EQ-low `0x7e`, state counter `0xda`. That packet is preserved as a
+   golden-vector test (`tests/test_djm.c::test_mixer_real_a9`) and the whole
+   window as `captures/stagehand-a9-mixerstate-20260831.pcap` — the first live
+   validation of the `0x39` decoder against hardware. **But it could not be
+   reproduced.** The A9 latches onto a single Stagehand peer at a time (its
+   164-byte binding table and paired keep-alive are how it tracks "who I am
+   serving"), and re-elects opaquely. The following were each tried and did
+   **not** reliably re-trigger the push: moving the faders/EQ during a live
+   capture; sending it transport/pref commands first; leaving a clean 70 s gap so
+   its binding could expire, then joining fresh; and running the **reference
+   `alphatheta-connect`** in `stagehand` mode (it too got `mixerState=0`). `0x58`
+   VU was never seen (dysentery notes it is near-zero without audio anyway).
 4. **Decoder correction from the real push.** In the `0x39`/`0x58` form a DJM
-   unicasts to a Stagehand peer, byte `0x21` is a length / state-counter (`0xa1`
+   unicasts to a Stagehand peer, byte `0x21` is a length / state-counter (`0xda`
    in the captured push), **not** the mixer's device number — the value the
    bridge form (§1.12) carries there. The context therefore resolves the mixer's
    true number from the roster (by the packet's name field) rather than trusting
    `0x21`.
 
-The decoders, persona and remote-control builders all ship: they are correct
-against the wire and produce data whenever the DJM elects to push. To make the
-A9 serve reliably, capture the genuine Pioneer Stagehand iPad app (or AlphaTheta
-desktop) against it and diff its keep-alive / any pre-push exchange, or check the
-mixer's Utility settings and firmware level.
+So on this rig the persona is correct and accepted (the CDJ serves it reliably,
+the A9 served it once), and the `0x39` decoder is proven against real A9 bytes;
+what remains device-dependent is *reliably* eliciting the A9 stream. The likely
+levers are the mixer's Utility/PRO&nbsp;DJ&nbsp;LINK settings or firmware level,
+or the genuine Pioneer Stagehand app holding the binding — capture that against
+this A9 and diff any pre-push exchange to find the election condition.
 
-Evidence: `captures/stagehand-reference-noresponse-20260831.pcap` (reference run,
-A9 silent).
+Evidence: `captures/stagehand-a9-mixerstate-20260831.pcap` (the A9 actually
+pushing 147 `0x39`) and `captures/stagehand-reference-noresponse-20260831.pcap`
+(reference run, A9 silent).
 
 ---
 
@@ -1613,7 +1622,7 @@ live CDJ-3000X / DJM-A9 rig; **[built]** implemented, not yet hardware-verified;
 | Touch Audio (`0x1e`/`0x1f`/`0x20`) | **[built]** timing rx decoded (122k pkts seen); PCM **[todo]** | complete |
 | Streaming source detection (Beatport / Direct Play / Cloud Direct Play / generic) | **[done]** `djl_streaming_source_of` classifies the (track type, slot) pair; enum + names + unit test | slots 5/7/8 unnamed by AlphaTheta |
 | Streaming tracks (Beatport LINK, Cloud Direct Play) | metadata + waveforms; no grid/cues | protocol-limited |
-| DJM-A9 / V10 mixer state (`0x39`) | **[done]** full field decoder, unit-tested, and **read correctly from a real A9 push** in the one session it appeared (§1.14); this A9 gates/serves it only intermittently | decoder verified on real bytes; elicitation gated by the mixer |
+| DJM-A9 / V10 mixer state (`0x39`) | **[done]** full field decoder, unit-tested, and **validated against a real A9 push** (147 packets captured; golden-vector test + pcap kept) (§1.14); this A9 re-elects the push opaquely | decoder verified on real hardware bytes; reliable elicitation still device-gated |
 | DJM VU stream (`0x58`) | **[done]** 15-segment ladders + peaks decoded, unit-tested; never seen live (same mixer gate) | decoder complete; not seen live |
 | Stagehand persona (`0x0a`/`0x02`/`0x06`, type `0x05`) | **[done]** implemented, golden-vector tested, **proven byte-for-byte equal to the reference on the wire**, and **accepted by the CDJ-3000X** (which unicasts its `0x0b`/`0x0a` monitor stream to us); the A9's `0x39` push is intermittent (§1.14) | persona correct and accepted; A9 push flaky |
 | DJM bridge persona (`0xF9` keepalive + `0x57` subscribe) | **[built]** to the reference recipe; superseded by the Stagehand persona (§1.12, §1.14) | measured 2026-08-28 |

@@ -20,13 +20,23 @@ observations refine that:
 - The **CDJ-3000X reliably serves the persona** — it unicasts its Stagehand
   monitor stream (~30/s `0x0b` telemetry + ~4/s `0x0a` status) to us the moment
   we are online. So AlphaTheta players do accept the persona.
-- The A9 **did** push real `0x39` fader-status once (57 packets, plausible
-  values matching this unit) in a single unreproducible window, then stopped.
+- The A9 **did** push real `0x39` fader-status (147 packets + `0x6a` heartbeat +
+  a 164-byte device table, 286 unicast to us in all) in one window — preserved as
+  `stagehand-a9-mixerstate-20260831.pcap` and distilled into the
+  `test_mixer_real_a9` golden-vector test. It could not be reproduced (movement,
+  commands, a clean gap, and the reference implementation were all tried).
 
-So the persona is correct and accepted; the A9's `0x39`/`0x58` push is gated and
-intermittent on this rig — a device-side condition (Utility/`PRO DJ LINK` setting,
-firmware, or an election state), not our code. The same A9 also ignored the
-`0xF9` bridge persona (§1.12). Full analysis in ARCHITECTURE.md §1.14.
+So the persona is correct and accepted, and the `0x39` decoder is now validated
+against real A9 bytes; what stays device-gated is *reliably* eliciting the stream
+(the A9 re-elects its single Stagehand peer opaquely). The same A9 also ignored
+the `0xF9` bridge persona (§1.12). Full analysis in ARCHITECTURE.md §1.14.
+
+# A9 mixer-state proof — stagehand-a9-mixerstate-20260831.pcap
+
+The A9 unicasting 147 real `0x39` fader-status packets to libdjlink's Stagehand
+persona (plus `0x6a` and a 164-byte device table). One `0x39` is the golden
+vector in `tests/test_djm.c`; decoded values (xf `0x7a`, EQ unity `0x80`, CH1
+fader `0xff`, CH2 EQ-low `0x7e`) match this unit and dysentery's description.
 
 # Reference capture — reference-20260826-234257.pcap
 

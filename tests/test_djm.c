@@ -11,6 +11,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 extern int djl_test_checks;
 extern int djl_test_failures;
@@ -245,11 +246,69 @@ static void test_vu(void)
     CHECK_EQ_U(djl_decode_vu_meters(b, 0x100, 4, &v), DJL_ERR_SHORT);
 }
 
+/* Real DJM-A9 0x39 fader-status packet, captured off the rig on 2026-08-31 while
+ * the library was online as a Stagehand peer (the A9 pushed 147 of these; this is
+ * one). Preserved in captures/stagehand-a9-mixerstate-20260831.pcap. This is the
+ * first live validation of the 0x39 decoder against real hardware (previously the
+ * fixtures were synthetic). Note byte 0x21 is 0xda here — in the form a DJM
+ * unicasts to a Stagehand peer that byte is a length/state-counter, not the
+ * device number (the context resolves the true number from the roster). */
+static const char *A9_0x39_REAL =
+    "5173707431576d4a4f4c39444a4d2d4139000000000000000000000000003a03"
+    "00da00e6028a008080008080000000ff01000000000000000000000002760080"
+    "80007e8000000000000000000000000000000000020000807f00808000000000"
+    "000000000000000000000000026e008080008080000000ff0200000000000000"
+    "0000000000000000000000000000000000000000000000000000000000000000"
+    "00000000000000000000000000000000000000007a0000003a00000000000000"
+    "248080000000008000000001010104038000ff078000000000ff000000000000"
+    "800100000000807fff800069000100000000801f00804d010000000000000000"
+    "00000000000000000000";
+
+static size_t unhex_local(const char *hex, uint8_t *out, size_t cap)
+{
+    size_t n = 0;
+    for (const char *p = hex; p[0] && p[1] && n < cap; p += 2) {
+        char b[3] = { p[0], p[1], 0 };
+        out[n++] = (uint8_t)strtoul(b, NULL, 16);
+    }
+    return n;
+}
+
+static void test_mixer_real_a9(void)
+{
+    uint8_t b[300];
+    size_t n = unhex_local(A9_0x39_REAL, b, sizeof b);
+    CHECK_EQ_U(n, 266);                       /* real A9 0x39 is 266 bytes */
+
+    djl_djm_mixer m;
+    CHECK_EQ_U(djl_decode_djm_mixer(b, n, 4, &m), DJL_OK);
+    CHECK(strcmp(m.name, "DJM-A9") == 0, "name decodes");
+    CHECK_EQ_U(m.channels, 4);
+
+    /* CH1: source line, trim ~0x8a, EQ all at unity, fader full up. */
+    CHECK_EQ_U(m.ch[0].input_src, 0x02);
+    CHECK_EQ_U(m.ch[0].trim,      0x8a);
+    CHECK_EQ_U(m.ch[0].eq_hi,     0x80);
+    CHECK_EQ_U(m.ch[0].eq_mid,    0x80);
+    CHECK_EQ_U(m.ch[0].eq_lo,     0x80);
+    CHECK_EQ_U(m.ch[0].fader,     0xff);
+    /* CH2: fader down, and the distinctive EQ-low = 0x7e that first proved the
+     * per-channel stride against this exact unit. */
+    CHECK_EQ_U(m.ch[1].input_src, 0x02);
+    CHECK_EQ_U(m.ch[1].eq_lo,     0x7e);
+    CHECK_EQ_U(m.ch[1].fader,     0x00);
+    /* Crossfader near centre, as dysentery notes for this A9 (~0x78). */
+    CHECK_EQ_U(m.crossfader,      0x7a);
+    /* Byte 0x21 in the Stagehand-form push is the len/state counter, not the id. */
+    CHECK_EQ_U(m.number,          0xda);
+}
+
 void djl_test_djm(void);
 void djl_test_djm(void)
 {
     test_mixer_channels();
     test_mixer_globals();
     test_mixer_rejects();
+    test_mixer_real_a9();
     test_vu();
 }
