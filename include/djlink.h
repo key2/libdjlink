@@ -59,8 +59,10 @@ DJL_API uint64_t djl_now_ms(void);
  * struct changes, so it is ABI-compatible with 0.3.
  * 0.5.0 added the Stagehand persona (cfg.stagehand) that unlocks DJM 0x39/0x58
  * fader/VU streaming, plus CDJ transport (0x07) and preference-write (0x6b)
- * remote control. djl_config grew one bool, so the soname changes; the
- * djl_event union did not. */
+ * remote control, streaming-source detection, and an unverified Opus Quad
+ * 0x56 binary-push decoder. djl_config grew one bool and the djl_event union
+ * grew a new (small) member and event kind, so the soname changes; sizeof
+ * djl_event is unchanged (opus_binary is smaller than the existing members). */
 #define DJL_VERSION_MAJOR  0
 #define DJL_VERSION_MINOR  5
 #define DJL_VERSION_PATCH  0
@@ -434,6 +436,47 @@ typedef struct {
 DJL_API djl_err djl_decode_vu_meters(const uint8_t *buf, size_t len,
                                      uint8_t channels, djl_vu_meters *out);
 
+/* ------------------------------------------------------------------ */
+/* Opus Quad / all-in-one binary-data push (0x56)  — UNVERIFIED         */
+/* ------------------------------------------------------------------ */
+
+/* All-in-one units (Opus Quad, XDJ-RX/XZ/AZ) cannot be joined as a virtual CDJ.
+ * The Opus Quad additionally pushes artwork and phrase/analysis data as a
+ * sequenced 0x56 binary stream, and reports its four decks as device numbers
+ * 9..12 (physical decks 1..4). This header/decoder is ported from the community
+ * analysis referenced by alphatheta-connect (docs/opus-quad-support-plan.md ->
+ * github.com/kyleawayan/opus-quad-pro-dj-link-analysis). There is NO Opus/XDJ on
+ * the development rig, so the offsets are decoded to the documentation, NOT
+ * verified against hardware; treat the field values as provisional. The media
+ * side (its exportLibrary.db) is already covered by the OneLibrary reader. */
+
+/* Deck numbers 9..12 belong to an Opus/all-in-one unit (physical decks 1..4). */
+DJL_API bool    djl_is_opus_deck(uint8_t device_number);
+/* Map an Opus deck number (9..12) to a 1..4 physical deck; pass-through otherwise. */
+DJL_API uint8_t djl_opus_deck_to_physical(uint8_t device_number);
+
+typedef enum {
+    DJL_OPUS_DATA_UNKNOWN = 0,
+    DJL_OPUS_DATA_IMAGE   = 0x02,   /* album art */
+    DJL_OPUS_DATA_TYPE4   = 0x04,   /* purpose unconfirmed */
+    DJL_OPUS_DATA_TYPE6   = 0x06    /* purpose unconfirmed */
+} djl_opus_data_type;
+
+typedef struct {
+    uint8_t  deck;          /* 0x21: device number (9..12 on an Opus) */
+    uint8_t  data_type;     /* 0x25: djl_opus_data_type */
+    uint32_t track_id;      /* 0x28: big-endian track id */
+    uint8_t  sequence;      /* 0x31: packet index within the sequence */
+    uint8_t  total;         /* 0x33: total packets in the sequence */
+    uint32_t payload_off;   /* 0x34: where the payload fragment begins */
+    uint32_t payload_len;   /* bytes from payload_off to the end of the datagram */
+} djl_opus_binary;
+
+/* Decode the header of an Opus 0x56 binary-data push. Pure; payload bytes stay
+ * in the caller's buffer at out->payload_off. UNVERIFIED offsets (see above). */
+DJL_API djl_err djl_decode_opus_binary(const uint8_t *buf, size_t len,
+                                       djl_opus_binary *out);
+
 typedef struct {
     uint8_t  number;
     char     name[DJL_NAME_LEN + 1];
@@ -675,6 +718,7 @@ typedef enum {
     DJL_EV_REKORDBOX_LINK,
     DJL_EV_DJM_MIXER,      /* 0x39 fader status; carries the full djl_djm_mixer */
     DJL_EV_VU_METERS,      /* 0x58 VU; carries peaks, full ladders via pull */
+    DJL_EV_OPUS_BINARY,    /* 0x56 Opus binary push header (unverified) */
     DJL_EV__COUNT
 } djl_event_kind;
 
@@ -733,6 +777,9 @@ typedef struct {
             uint16_t channel_peak[6];
             uint16_t master_peak[2];
         } vu_peaks;
+        /* Opus 0x56 push header (unverified). The payload fragment is not
+         * copied here; grab it with the raw hook if reassembly is needed. */
+        djl_opus_binary opus_binary;
     } u;
 } djl_event;
 

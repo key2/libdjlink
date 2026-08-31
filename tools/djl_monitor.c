@@ -263,6 +263,14 @@ static void handle(const djl_event *ev, djl_context *ctx)
         printf(" M=%u/%u\n", v->master_peak[0], v->master_peak[1]);
         break;
     }
+    case DJL_EV_OPUS_BINARY: {
+        const djl_opus_binary *o = &ev->u.opus_binary;
+        printf("opus  deck%-2u (p%u) type=0x%02x track=%u seq=%u/%u payload=%u B "
+               "[UNVERIFIED]\n",
+               o->deck, djl_opus_deck_to_physical(o->deck), o->data_type,
+               o->track_id, o->sequence, o->total, o->payload_len);
+        break;
+    }
     case DJL_EV_REKORDBOX_LINK: {
         const djl_rb_link *r = &ev->u.rb_link;
         printf("rblnk 0x%02x %-13s dev=%-3u sub=%u len=%u%s",

@@ -243,6 +243,49 @@ static void test_streaming_source(void)
     CHECK_EQ_U(DJL_SLOT_UNKNOWN8, DJL_SLOT_STREAM8);
 }
 
+static const uint8_t MAGIC10[10] =
+    {0x51,0x73,0x70,0x74,0x31,0x57,0x6d,0x4a,0x4f,0x4c};
+
+static void test_opus_binary(void)
+{
+    /* Deck-number helpers. */
+    CHECK(djl_is_opus_deck(9),  "9 is an Opus deck");
+    CHECK(djl_is_opus_deck(12), "12 is an Opus deck");
+    CHECK(!djl_is_opus_deck(1), "1 is a normal CDJ");
+    CHECK(!djl_is_opus_deck(13),"13 is out of range");
+    CHECK_EQ_U(djl_opus_deck_to_physical(9),  1);
+    CHECK_EQ_U(djl_opus_deck_to_physical(12), 4);
+    CHECK_EQ_U(djl_opus_deck_to_physical(2),  2);   /* pass-through */
+
+    /* Synthetic 0x56 push (offsets per docs/opus-quad-support-plan.md). */
+    uint8_t b[64];
+    memset(b, 0, sizeof b);
+    memcpy(b, MAGIC10, 10);
+    b[0x0a] = 0x56;
+    b[0x21] = 10;                 /* deck (physical 2) */
+    b[0x25] = 0x02;               /* image */
+    b[0x28] = 0x00; b[0x29] = 0x00; b[0x2a] = 0x01; b[0x2b] = 0x2c; /* track 300 */
+    b[0x31] = 3;                  /* sequence */
+    b[0x33] = 7;                  /* total */
+    b[0x34] = 0xaa; b[0x35] = 0xbb;
+
+    djl_opus_binary ob;
+    CHECK_EQ_U(djl_decode_opus_binary(b, sizeof b, &ob), DJL_OK);
+    CHECK_EQ_U(ob.deck, 10);
+    CHECK_EQ_U(ob.data_type, DJL_OPUS_DATA_IMAGE);
+    CHECK_EQ_U(ob.track_id, 300);
+    CHECK_EQ_U(ob.sequence, 3);
+    CHECK_EQ_U(ob.total, 7);
+    CHECK_EQ_U(ob.payload_off, 0x34);
+    CHECK_EQ_U(ob.payload_len, sizeof b - 0x34);
+
+    /* Rejects a non-0x56 packet and a too-short one. */
+    b[0x0a] = 0x39;
+    CHECK_EQ_U(djl_decode_opus_binary(b, sizeof b, &ob), DJL_ERR_UNKNOWN);
+    b[0x0a] = 0x56;
+    CHECK_EQ_U(djl_decode_opus_binary(b, 0x20, &ob), DJL_ERR_SHORT);
+}
+
 void djl_test_stagehand(void);
 void djl_test_stagehand(void)
 {
@@ -250,4 +293,5 @@ void djl_test_stagehand(void)
     test_transport_packet();
     test_pref_write_packet();
     test_streaming_source();
+    test_opus_binary();
 }

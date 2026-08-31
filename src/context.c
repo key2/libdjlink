@@ -160,7 +160,9 @@ static void roster_saw_keep_alive(djl_context *ctx, const djl_keep_alive *ka,
     e->info.is_mixer = (ka->device_type == DJL_DEVTYPE_MIXER ||
                         ka->device_type == DJL_DEVTYPE_MIXER_MODERN ||
                         ka->number == 0x21);
-    e->info.is_cdj   = (ka->device_type == DJL_DEVTYPE_CDJ && ka->number <= 6);
+    /* CDJs are 1..6; Opus / all-in-one decks report 9..12 (physical 1..4). */
+    e->info.is_cdj   = (ka->device_type == DJL_DEVTYPE_CDJ &&
+                        (ka->number <= 6 || djl_is_opus_deck(ka->number)));
 
     if (is_new) {
         djl_log(ctx, DJL_LOG_INFO,
@@ -690,6 +692,24 @@ static void handle_status(djl_context *ctx, const uint8_t *buf, size_t len,
     case DJL_PKT_VU_STREAM:
         handle_vu_meters(ctx, buf, len, now);   /* 0x58, if a DJM sends it here */
         return;
+    case DJL_PKT_OPUS_DATA_RESP: {
+        /* 0x56 Opus binary push (artwork / phrase data). UNVERIFIED offsets; we
+         * surface the header so a consumer on an Opus rig can reassemble via the
+         * raw hook. Falls through to unknown if it does not decode. */
+        djl_opus_binary ob;
+        if (djl_decode_opus_binary(buf, len, &ob) == DJL_OK) {
+            djl_event ev;
+            memset(&ev, 0, sizeof ev);
+            ev.kind    = DJL_EV_OPUS_BINARY;
+            ev.device  = ob.deck;
+            ev.time_ms = now - ctx->t0;
+            ev.u.opus_binary = ob;
+            djl_emit(ctx, &ev);
+            return;
+        }
+        emit_unknown_packet(ctx, DJL_PORT_STATUS, buf, len, now);
+        return;
+    }
     case DJL_PKT_MEDIA_RESPONSE: {
         djl_media_details md;
         if (djl_decode_media_details(buf, len, &md) != DJL_OK) return;

@@ -552,6 +552,43 @@ djl_err djl_decode_vu_meters(const uint8_t *buf, size_t len, uint8_t channels,
     return DJL_OK;
 }
 
+/* ---------------- Opus Quad / all-in-one binary push (0x56) ----------------
+ *
+ * UNVERIFIED. Offsets ported from the community Opus analysis referenced by
+ * alphatheta-connect (docs/opus-quad-support-plan.md). No Opus/XDJ hardware on
+ * the dev rig, so this decodes to the documentation, not to captured bytes. */
+
+bool djl_is_opus_deck(uint8_t device_number)
+{
+    return device_number >= 9 && device_number <= 12;
+}
+
+uint8_t djl_opus_deck_to_physical(uint8_t device_number)
+{
+    return djl_is_opus_deck(device_number) ? (uint8_t)(device_number - 8)
+                                           : device_number;
+}
+
+djl_err djl_decode_opus_binary(const uint8_t *buf, size_t len, djl_opus_binary *out)
+{
+    if (!out) return DJL_ERR_INVAL;
+    if (!djl_wire_has_magic(buf, len)) return DJL_ERR_UNKNOWN;
+    if (buf[0x0a] != 0x56) return DJL_ERR_UNKNOWN;
+    /* Need through the total-packets byte at 0x33, plus a byte of payload. */
+    if (len < 0x34) return DJL_ERR_SHORT;
+    memset(out, 0, sizeof *out);
+
+    bool ok;
+    out->deck        = buf[0x21];
+    out->data_type   = buf[0x25];
+    out->track_id    = (uint32_t)djl_wire_be(buf, len, 0x28, 4, &ok);
+    out->sequence    = buf[0x31];
+    out->total       = buf[0x33];
+    out->payload_off = 0x34;
+    out->payload_len = (uint32_t)(len - 0x34);
+    return DJL_OK;
+}
+
 djl_err djl_decode_beat(const uint8_t *buf, size_t len, djl_beat *out)
 {
     if (!out) return DJL_ERR_INVAL;
@@ -840,6 +877,7 @@ const char *djl_event_kind_name(djl_event_kind k)
     case DJL_EV_REKORDBOX_LINK:      return "RekordboxLink";
     case DJL_EV_DJM_MIXER:           return "DjmMixer";
     case DJL_EV_VU_METERS:           return "VuMeters";
+    case DJL_EV_OPUS_BINARY:         return "OpusBinary";
     default:                         return "?";
     }
 }

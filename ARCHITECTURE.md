@@ -477,6 +477,24 @@ These units cannot be talked to as a CDJ. Instead we pose as **rekordbox**:
   (`OpusProvider.getDeviceSqlRekordboxIdAndSlotNumberFromPssi`).
 - Opus exposes device numbers 1, 2 (players) and 33 (mixer).
 
+**Binary-data push (`0x56`) and deck numbering — UNVERIFIED, no hardware.**
+`alphatheta-connect`'s `docs/opus-quad-support-plan.md` (from
+`github.com/kyleawayan/opus-quad-pro-dj-link-analysis`) records two extra facts
+about the Opus Quad specifically, which libdjlink scopes but **cannot verify**
+(there is no Opus/XDJ on the rig):
+
+- Its four decks report device numbers **9..12** (physical decks 1..4), not 1..4.
+  `djl_is_opus_deck()` / `djl_opus_deck_to_physical()` expose the mapping, and the
+  roster now flags 9..12 keep-alives as CDJs.
+- It pushes artwork and phrase/analysis data as a **sequenced `0x56`** stream:
+  deck at `0x21`, data type at `0x25` (`0x02` image), track id (BE) at `0x28`,
+  sequence at `0x31`, total packets at `0x33`, payload from `0x34`.
+  `djl_decode_opus_binary()` returns that header (pure), and the context surfaces
+  it as `DJL_EV_OPUS_BINARY`; a consumer reassembles the fragments via the raw
+  hook. The offsets are transcribed from the community analysis, not confirmed on
+  hardware, so the field values are provisional. The media side (the unit's
+  `exportLibrary.db`) is already fully covered by the OneLibrary reader (§1.13).
+
 ### 1.10 Stagehand-class devices (device type `0x05`)
 
 Documented in `dysentery/.../stagehand.adoc`. Distinguishing features our parser must
@@ -1565,7 +1583,8 @@ live CDJ-3000X / DJM-A9 rig; **[built]** implemented, not yet hardware-verified;
 | NFS + `export.pdb` + ANLZ | **[done]** full client: portmap/mount/NFSv2, DeviceSQL reader with cross-table names, PMAI walker. Verified live: mount `/C/`, 212992-byte `export.pdb`, 40 tracks, track 33 grid+cues+phrases+waveforms | complete |
 | OneLibrary `exportLibrary.db` (SQLCipher) | **[done]** self-contained SQLCipher-4 decrypt (SHA-512/HMAC/PBKDF2/AES-256, KAT-tested) + libsqlite3 reader; NFS glue + OPUS fallback. Verified live: decrypt + read track 33 identical to PDB/dbserver (§1.13) | complete |
 | Device Library Plus (`exportLibrary.db`) | parse if a key is supplied | **encrypted; key not public** |
-| Opus Quad / XDJ-AZ via rekordbox-Lighting + PSSI matching | **[todo]** step 10 | mostly complete |
+| Opus Quad / XDJ-AZ via rekordbox-Lighting + PSSI matching | **[todo]** step 10 (needs the hardware) | mostly complete |
+| Opus Quad deck numbering (9..12) + `0x56` binary push | **[built, UNVERIFIED]** deck-id helpers + `djl_decode_opus_binary` + `DJL_EV_OPUS_BINARY`, unit-tested against a synthetic vector; offsets from community analysis, no Opus on the rig (§1.9) | not hardware-verified |
 | rekordbox EXPORT NFS *server* (CDJs mount us) + UTF-16LE names | **[todo]** whole subsystem, see §1.11 | observed 2026-08-27 |
 | rekordbox link UDP control (`0x11`,`0x16`,`0x30`,`0x31`,`0x46`,`0x47`,`0x80`) | **[done]** all seven classified and decoded (subtype/device/len_r + per-kind payloads, host name UTF-16**BE**); 77/77 capture packets decode | measured first-hand, §1.11 |
 | Touch Audio (`0x1e`/`0x1f`/`0x20`) | **[built]** timing rx decoded (122k pkts seen); PCM **[todo]** | complete |
