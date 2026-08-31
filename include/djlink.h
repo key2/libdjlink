@@ -56,9 +56,13 @@ DJL_API uint64_t djl_now_ms(void);
  * 0.3.0 added the DJM bridge: new config fields, event kinds and decoders (the
  * djl_event union did not grow, but djl_config did).
  * 0.4.0 added the OneLibrary (exportLibrary.db) reader: new functions only, no
- * struct changes, so it is ABI-compatible with 0.3. */
+ * struct changes, so it is ABI-compatible with 0.3.
+ * 0.5.0 added the Stagehand persona (cfg.stagehand) that unlocks DJM 0x39/0x58
+ * fader/VU streaming, plus CDJ transport (0x07) and preference-write (0x6b)
+ * remote control. djl_config grew one bool, so the soname changes; the
+ * djl_event union did not. */
 #define DJL_VERSION_MAJOR  0
-#define DJL_VERSION_MINOR  4
+#define DJL_VERSION_MINOR  5
 #define DJL_VERSION_PATCH  0
 
 #define DJL_NAME_LEN       0x14   /* 20 */
@@ -131,21 +135,32 @@ typedef enum {
 
 DJL_API const char *djl_packet_kind_name(djl_packet_kind k);
 
-/* Track source slot, CDJ status byte 0x29 */
+/* Track source slot, CDJ status byte 0x29.
+ * Slots 5, 7 and 8 are used by CDJ-3000 / OMNIS-DUO firmware for streaming
+ * services (TIDAL / Apple Music / SoundCloud etc.); their exact per-service
+ * mapping is not published, so they are named generically here and classified
+ * by djl_streaming_source(). Slot 6 is Streaming-Direct-Play and slot 9 is
+ * Beatport LINK, both confirmed by AlphaTheta's own tooling. */
 typedef enum {
     DJL_SLOT_NONE       = 0,
     DJL_SLOT_CD         = 1,
     DJL_SLOT_SD         = 2,
     DJL_SLOT_USB        = 3,
     DJL_SLOT_COLLECTION = 4,   /* rekordbox on a laptop */
-    DJL_SLOT_UNKNOWN5   = 5,
+    DJL_SLOT_STREAM5    = 5,   /* streaming service (TIDAL/Apple Music/...) */
     DJL_SLOT_STREAM_DP  = 6,   /* Streaming Direct Play */
-    DJL_SLOT_USB2       = 7,   /* XDJ-AZ four-deck mode */
-    DJL_SLOT_UNKNOWN8   = 8,
-    DJL_SLOT_BEATPORT   = 9
+    DJL_SLOT_STREAM7    = 7,   /* streaming service / XDJ-AZ four-deck USB2 */
+    DJL_SLOT_STREAM8    = 8,   /* streaming service (Cloud Direct Play) */
+    DJL_SLOT_BEATPORT   = 9    /* Beatport LINK */
 } djl_slot;
 
+/* Back-compat aliases for pre-0.5 names. */
+#define DJL_SLOT_UNKNOWN5 DJL_SLOT_STREAM5
+#define DJL_SLOT_UNKNOWN8 DJL_SLOT_STREAM8
+#define DJL_SLOT_USB2     DJL_SLOT_STREAM7
+
 DJL_API const char *djl_slot_name(djl_slot s);
+DJL_API bool djl_slot_is_streaming(djl_slot slot);
 
 /* Track type, CDJ status byte 0x2a */
 typedef enum {
@@ -157,6 +172,24 @@ typedef enum {
 } djl_track_type;
 
 DJL_API const char *djl_track_type_name(djl_track_type t);
+
+/* A streaming music source, derived from the (track type, slot) pair a player
+ * reports. Only Beatport, Streaming-Direct-Play and Cloud-Direct-Play are
+ * named with confidence; the other streaming slots collapse to
+ * DJL_STREAM_GENERIC because AlphaTheta has not published the per-service
+ * byte. DJL_STREAM_NONE means the track is local (rekordbox/USB/SD/CD). */
+typedef enum {
+    DJL_STREAM_NONE = 0,
+    DJL_STREAM_GENERIC,        /* streaming, service not identifiable */
+    DJL_STREAM_DIRECT_PLAY,    /* slot 6: Streaming Direct Play */
+    DJL_STREAM_CLOUD_DIRECT,   /* slot 8: Cloud Direct Play */
+    DJL_STREAM_BEATPORT        /* slot 9: Beatport LINK */
+} djl_streaming_source;
+
+/* Classify the streaming source of a track from its type (byte 0x2a) and slot
+ * (byte 0x29). Returns DJL_STREAM_NONE for local media. Pure. */
+DJL_API djl_streaming_source djl_streaming_source_of(djl_track_type type, djl_slot slot);
+DJL_API const char *djl_streaming_source_name(djl_streaming_source s);
 
 /* Play mode, CDJ status byte 0x7b (P1) */
 typedef enum {
@@ -525,6 +558,18 @@ typedef struct {
      * announced identity to the network and is only useful when a DJM is
      * present. Ignored under observe_only. */
     bool              djm_bridge;
+    /* Join the network as a virtual Stagehand iPad (device type 0x05, model
+     * code 0x20) instead of a virtual CDJ. A DJM-A9 pushes its fader-status
+     * (0x39, ~4 Hz) and VU-meter (0x58, ~30 Hz) streams unsolicited to any
+     * Stagehand-class device it sees, so this mode is how DJL_EV_DJM_MIXER and
+     * DJL_EV_VU_METERS are obtained (the 0xF9 bridge persona above was
+     * rejected by A9 firmware). The persona replaces the virtual CDJ: it uses
+     * the abbreviated handshake (0x0a x3, 0x02 x3, then 0x06 keepalives every
+     * 2 s), a randomized runtime device number in 141..211 and a randomized
+     * AlphaTheta-OUI MAC, exactly as the real app does. It also enables CDJ
+     * remote control (djl_transport_*, djl_write_pref_*). Mutually exclusive
+     * with djm_bridge and send_status; ignored under observe_only. */
+    bool              stagehand;
     djl_log_fn        log;
     void             *log_ud;
     djl_log_level     log_level;
@@ -727,6 +772,46 @@ DJL_API djl_err djl_send_on_air(djl_context *ctx, uint8_t channel_mask, bool six
 DJL_API djl_err djl_send_fader_start(djl_context *ctx, uint8_t start_mask, uint8_t stop_mask);
 DJL_API djl_err djl_load_track(djl_context *ctx, uint8_t target, uint8_t source_player,
                                djl_slot slot, djl_track_type type, uint32_t rekordbox_id);
+
+/* ------------------------------------------------------------------ */
+/* Stagehand remote control: CDJ transport and preference writes.        */
+/*                                                                       */
+/* These reproduce the command channel the Pioneer Stagehand iPad app    */
+/* uses. They require cfg.stagehand and an assigned runtime number, and  */
+/* target a specific player. Byte layout ported from the dysentery       */
+/* stagehand.adoc capture analysis; see ARCHITECTURE.md section 1.14.    */
+/* ------------------------------------------------------------------ */
+
+/* Raw transport opcodes carried at body byte 0x2b of the 0x07 packet
+ * (port 50001). Play is a paired 0x0f/0x14; the others are single. */
+typedef enum {
+    DJL_TRANSPORT_PLAY      = 0x0f,  /* paired with 0x14 */
+    DJL_TRANSPORT_PLAY2     = 0x14,
+    DJL_TRANSPORT_SKIP_FWD  = 0x18,
+    DJL_TRANSPORT_SKIP_BACK = 0x19,
+    DJL_TRANSPORT_SEEK_FWD  = 0x1a,
+    DJL_TRANSPORT_SEEK_BACK = 0x1b
+} djl_transport_op;
+
+/* Send one raw transport command with an explicit press (true) / release
+ * (false) flag. The convenience wrappers below cover the common cases. */
+DJL_API djl_err djl_transport(djl_context *ctx, uint8_t player,
+                              djl_transport_op op, bool press);
+
+/* Play: paired 0x0f + 0x14 press. Pause: 0x14 release. */
+DJL_API djl_err djl_transport_play(djl_context *ctx, uint8_t player);
+DJL_API djl_err djl_transport_pause(djl_context *ctx, uint8_t player);
+/* Skip to the next/previous track: a press immediately followed by release. */
+DJL_API djl_err djl_transport_skip(djl_context *ctx, uint8_t player, bool forward);
+/* Jog-wheel style search hold. Call with press=true to start, false to stop. */
+DJL_API djl_err djl_transport_seek(djl_context *ctx, uint8_t player,
+                                   bool forward, bool press);
+
+/* Preference writes via the 0x6b packet (port 50002). */
+DJL_API djl_err djl_write_pref_on_air(djl_context *ctx, uint8_t player, bool on);
+/* Quantize: enum_index 0 = 1 beat, 1 = 1/2, 2 = 1/4, ... (wire value 0x80|idx). */
+DJL_API djl_err djl_write_pref_quantize(djl_context *ctx, uint8_t player,
+                                        uint8_t enum_index);
 
 /* Our advertised playback state, reflected in the status packets we send. */
 DJL_API djl_err djl_set_tempo(djl_context *ctx, double bpm);

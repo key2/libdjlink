@@ -189,6 +189,121 @@ size_t djl_build_bridge_subscribe(uint8_t *buf, size_t cap, const djl_identity *
     return total;
 }
 
+/* ---------------- Stagehand persona (port 50000, broadcast) ----------------
+ *
+ * Reproduces the Pioneer Stagehand iPad join, byte-for-byte per dysentery's
+ * stagehand.adoc and alphatheta-connect's virtualcdj/stagehand.ts. A DJM-A9
+ * unicasts its 0x39 fader status and 0x58 VU streams to any device that
+ * announces this persona (device type 0x05, model code 0x20) — no subscribe
+ * packet is needed, unlike the 0xF9 bridge. See ARCHITECTURE.md section 1.14. */
+
+#define DJL_STAGEHAND_TYPE   0x05   /* keep-alive byte 0x34 / trailing announce byte */
+#define DJL_STAGEHAND_MODEL  0x20   /* keep-alive byte 0x35 */
+#define DJL_STAGEHAND_SYMBOL 0x3a   /* symbolic device number claimed at 0x2e */
+#define DJL_STAGEHAND_PROTO  0x03   /* byte 0x21: CDJ-3000-era protocol marker */
+
+/* Initial announcement (0x0a, 37 bytes). Structurally a pre-3000 announce but
+ * byte 0x21 = 0x03 and the trailing device-type byte 0x24 = 0x05. */
+size_t djl_build_stagehand_announce(uint8_t *buf, size_t cap, const djl_identity *id)
+{
+    const size_t total = 0x25;
+    if (cap < total) return 0;
+    memset(buf, 0, total);
+    if (!hdr_announce(buf, cap, 0x0a, 0x00, id)) return 0;
+    buf[0x20] = 0x01;
+    buf[0x21] = DJL_STAGEHAND_PROTO;
+    put_be16(buf, 0x22, (uint16_t)total);
+    buf[0x24] = DJL_STAGEHAND_TYPE;
+    return total;
+}
+
+/* Device-number claim (0x02, 50 bytes). Byte 0x2e is always the symbolic 0x3a,
+ * 0x2f is the 1..3 iteration counter, 0x30 the device type, 0x31 = 0x01. */
+size_t djl_build_stagehand_claim(uint8_t *buf, size_t cap, const djl_identity *id,
+                                 uint8_t n)
+{
+    const size_t total = 0x32;
+    if (cap < total) return 0;
+    memset(buf, 0, total);
+    if (!hdr_announce(buf, cap, 0x02, 0x00, id)) return 0;
+    buf[0x20] = 0x01;
+    buf[0x21] = DJL_STAGEHAND_PROTO;
+    put_be16(buf, 0x22, (uint16_t)total);
+    memcpy(buf + 0x24, id->ip, 4);
+    memcpy(buf + 0x28, id->mac, 6);
+    buf[0x2e] = DJL_STAGEHAND_SYMBOL;
+    buf[0x2f] = n;
+    buf[0x30] = DJL_STAGEHAND_TYPE;
+    buf[0x31] = 0x01;
+    return total;
+}
+
+/* Keep-alive (0x06, 54 bytes). Same envelope as a CDJ keep-alive but the
+ * runtime device number (141..211) sits at 0x24, byte 0x34 = 0x05 and byte
+ * 0x35 = 0x20. Byte 0x30 (peer count slot) is 1 and 0x33..0x30 = 01 00 00 00. */
+size_t djl_build_stagehand_keep_alive(uint8_t *buf, size_t cap, const djl_identity *id)
+{
+    const size_t total = 0x36;
+    if (cap < total) return 0;
+    memset(buf, 0, total);
+    if (!hdr_announce(buf, cap, 0x06, 0x00, id)) return 0;
+    buf[0x20] = 0x01;
+    buf[0x21] = DJL_STAGEHAND_PROTO;
+    put_be16(buf, 0x22, (uint16_t)total);
+    buf[0x24] = id->number;             /* runtime number, not the symbolic 0x3a */
+    buf[0x25] = 0x01;                   /* joined an existing network */
+    memcpy(buf + 0x26, id->mac, 6);
+    memcpy(buf + 0x2c, id->ip, 4);
+    buf[0x30] = 0x01;
+    buf[0x34] = DJL_STAGEHAND_TYPE;
+    buf[0x35] = DJL_STAGEHAND_MODEL;
+    return total;
+}
+
+/* ---------------- Stagehand remote control ----------------
+ *
+ * Transport (0x07, 56 bytes, port 50001) and preference write (0x6b, 124
+ * bytes, port 50002). Status framing: name at 0x0b. Offsets follow dysentery's
+ * stagehand.adoc single-control captures. The target CDJ's device number sits
+ * at the unicast peer-marker slot 0x1e, mirroring the Stagehand->A9 command
+ * frame. */
+
+size_t djl_build_transport(uint8_t *buf, size_t cap, const djl_identity *id,
+                           uint8_t target, uint8_t op, bool press, uint8_t corr)
+{
+    const size_t total = 0x38;          /* 56 bytes */
+    if (cap < total) return 0;
+    memset(buf, 0, total);
+    if (!hdr_status(buf, cap, 0x07, id)) return 0;   /* name at 0x0b */
+    buf[0x1e] = target;                 /* addressed CDJ device number */
+    buf[0x1f] = 0x01;
+    buf[0x20] = DJL_STAGEHAND_PROTO;    /* 0x03 */
+    buf[0x21] = corr;                   /* per-session correlation / view hash */
+    put_be16(buf, 0x22, 0x0030);        /* len_r: 48 bytes follow */
+    buf[0x28] = DJL_STAGEHAND_SYMBOL;   /* 0x3a sub-id */
+    buf[0x2b] = op;                     /* action byte */
+    buf[0x2d] = press ? 0x01 : 0x00;    /* press / release */
+    return total;
+}
+
+size_t djl_build_pref_write(uint8_t *buf, size_t cap, const djl_identity *id,
+                            uint8_t target, uint8_t on_air, uint8_t quantize)
+{
+    const size_t total = 0x7c;          /* 124 bytes */
+    if (cap < total) return 0;
+    memset(buf, 0, total);
+    if (!hdr_status(buf, cap, 0x6b, id)) return 0;   /* name at 0x0b */
+    buf[0x1e] = target;                 /* addressed CDJ device number */
+    buf[0x1f] = 0x01;
+    buf[0x20] = DJL_STAGEHAND_PROTO;    /* 0x03 */
+    buf[0x21] = DJL_STAGEHAND_SYMBOL;   /* 0x3a sub-id */
+    put_be16(buf, 0x22, 0x0050);        /* body length: 80 bytes */
+    buf[0x24] = 0x01;                   /* transaction flag: write */
+    if (on_air)   buf[0x2c] = on_air;   /* 0x80 OFF, 0x81 ON, 0 = untouched */
+    if (quantize) buf[0x3c] = quantize; /* 0x80 | enum_index, 0 = untouched */
+    return total;
+}
+
 size_t djl_build_number_in_use(uint8_t *buf, size_t cap, const djl_identity *id,
                                uint8_t defended, const uint8_t ip[4])
 {

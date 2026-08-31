@@ -18,9 +18,22 @@
 #define WATCH_PERIOD_MS   4000
 #define CLAIM_GAP_MS       300
 #define KEEPALIVE_MS      1500
+#define STAGEHAND_KA_MS   2000   /* the iPad broadcasts at ~2 s intervals */
+#define STAGEHAND_GAP_MS   305   /* handshake packet spacing */
 #define STATUS_MS          200
 #define EXPIRY_TICK_MS    1000
 #define DEVICE_EXPIRY_MS 10000
+
+/* Small non-cryptographic PRNG (splitmix64), seeded per context, used only to
+ * pick the randomized Stagehand device number, MAC and correlation byte. Kept
+ * local so it never disturbs the application's rand() state. */
+static uint64_t sm_next(uint64_t *s)
+{
+    uint64_t z = (*s += 0x9e3779b97f4a7c15ULL);
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    return z ^ (z >> 31);
+}
 
 /* ---------------- logging ---------------- */
 
@@ -337,6 +350,26 @@ static void numbering_tick(djl_context *ctx, uint64_t now)
             if (ctx->claim_step >= 3) { go_online(ctx, now); return; }
             n = djl_build_claim3(buf, sizeof buf, &ctx->id, ctx->claiming,
                                  (uint8_t)(ctx->claim_step + 1));
+            bcast(ctx, &ctx->sock_announce, buf, n);
+            ctx->claim_step++;
+        }
+        return;
+
+    /* ---- Stagehand persona: 0x0a x3 -> 0x02 x3 -> keep-alive ---- */
+    case DJL_ST_SH_ANNOUNCE:
+        if (now - ctx->state_since >= (uint64_t)ctx->claim_step * STAGEHAND_GAP_MS) {
+            if (ctx->claim_step >= 3) { enter_state(ctx, DJL_ST_SH_CLAIM, now); return; }
+            n = djl_build_stagehand_announce(buf, sizeof buf, &ctx->id);
+            bcast(ctx, &ctx->sock_announce, buf, n);
+            ctx->claim_step++;
+        }
+        return;
+
+    case DJL_ST_SH_CLAIM:
+        if (now - ctx->state_since >= (uint64_t)ctx->claim_step * STAGEHAND_GAP_MS) {
+            if (ctx->claim_step >= 3) { go_online(ctx, now); return; }
+            n = djl_build_stagehand_claim(buf, sizeof buf, &ctx->id,
+                                          (uint8_t)(ctx->claim_step + 1));
             bcast(ctx, &ctx->sock_announce, buf, n);
             ctx->claim_step++;
         }
@@ -841,6 +874,15 @@ static bool is_djm(const djl_device_info *d)
 static void send_keep_alive(djl_context *ctx)
 {
     uint8_t buf[DJL_MAX_PACKET];
+
+    /* Stagehand persona broadcasts its own keep-alive form and nothing else:
+     * no per-CDJ unicast, no bridge identity. */
+    if (ctx->cfg.stagehand) {
+        size_t sn = djl_build_stagehand_keep_alive(buf, sizeof buf, &ctx->id);
+        if (sn) bcast(ctx, &ctx->sock_announce, buf, sn);
+        return;
+    }
+
     ctx->id.peer_count = (uint8_t)(roster_count(ctx) + 1);
     size_t n = djl_build_keep_alive(buf, sizeof buf, &ctx->id);
     if (!n) return;
@@ -966,10 +1008,11 @@ static void *io_thread(void *arg)
         } else {
             if (!ctx->cfg.observe_only && now >= ctx->next_keepalive) {
                 send_keep_alive(ctx);
-                ctx->next_keepalive = now + KEEPALIVE_MS;
+                ctx->next_keepalive = now +
+                    (ctx->cfg.stagehand ? STAGEHAND_KA_MS : KEEPALIVE_MS);
             }
             if (!ctx->cfg.observe_only && now >= ctx->next_status) {
-                send_status_to_all(ctx);
+                send_status_to_all(ctx);          /* no-op under stagehand */
                 ctx->next_status = now + STATUS_MS;
             }
             if (ctx->cfg.djm_bridge && !ctx->cfg.observe_only) {
@@ -1034,6 +1077,30 @@ djl_err djl_context_create(const djl_config *cfg, djl_context **out)
     ctx->id.proto_version = cfg->proto_version ? cfg->proto_version : 0x03;
     ctx->id.peer_count    = 1;
 
+    /* Stagehand persona: pose as a virtual iPad, not a virtual CDJ. Overwrite
+     * the advertised identity and pick the randomized runtime number, MAC and
+     * correlation byte the real app draws per launch. The persona supersedes
+     * the CDJ presence, so send_status is forced off (it would announce a
+     * conflicting virtual-CDJ status stream). */
+    if (cfg->stagehand) {
+        uint64_t seed = djl_now_ms() ^ ((uint64_t)(uintptr_t)ctx << 1) ^
+                        ((uint64_t)ctx->iface.mac[5] << 8) ^ ctx->iface.mac[4];
+        ctx->id.device_type   = DJL_DEVTYPE_STAGEHAND;   /* 0x05 */
+        ctx->id.model_code    = 0x20;
+        ctx->id.proto_version = 0x03;
+        /* Runtime device number in the observed 141..211 range. */
+        ctx->sh_number = (uint8_t)(141 + (sm_next(&seed) % (211 - 141 + 1)));
+        ctx->sh_corr   = (uint8_t)(sm_next(&seed) & 0xff);
+        /* Randomized AlphaTheta-OUI MAC for the protocol payloads (the wire
+         * Ethernet source stays the real NIC MAC, exactly as iOS does). */
+        ctx->id.mac[0] = 0xc8; ctx->id.mac[1] = 0x3d; ctx->id.mac[2] = 0xfc;
+        ctx->id.mac[3] = (uint8_t)(sm_next(&seed) & 0xff);
+        ctx->id.mac[4] = (uint8_t)(sm_next(&seed) & 0xff);
+        ctx->id.mac[5] = (uint8_t)(sm_next(&seed) & 0xff);
+        ctx->cfg.send_status = false;
+        ctx->cfg.djm_bridge  = false;   /* mutually exclusive personas */
+    }
+
     ctx->adv_tempo = 120.0;
     ctx->adv_bib   = 1;
     ctx->adv_beat  = 0;
@@ -1077,7 +1144,14 @@ djl_err djl_context_start(djl_context *ctx)
 
     ctx->t0 = djl_now_ms();
     ctx->next_expiry = ctx->t0 + EXPIRY_TICK_MS;
-    enter_state(ctx, DJL_ST_WATCHING, ctx->t0);
+    if (ctx->cfg.stagehand && !ctx->cfg.observe_only) {
+        /* Skip the CDJ watch/claim: the persona uses its own abbreviated
+         * handshake and a pre-drawn runtime number, then goes online. */
+        ctx->claiming = ctx->sh_number;
+        enter_state(ctx, DJL_ST_SH_ANNOUNCE, ctx->t0);
+    } else {
+        enter_state(ctx, DJL_ST_WATCHING, ctx->t0);
+    }
     ctx->running = true;
 
     if (ctx->cfg.auto_metadata && !ctx->cfg.observe_only) {
@@ -1378,6 +1452,80 @@ djl_err djl_load_track(djl_context *ctx, uint8_t target, uint8_t source_player,
     unicast(ctx, &ctx->sock_status, t->info.ip, DJL_PORT_STATUS, buf, n);
     pthread_mutex_unlock(&ctx->lock);
     return DJL_OK;
+}
+
+/* ---------------- Stagehand remote control ---------------- */
+
+/* Look up a target player's IP under the lock and send a control packet to it.
+ * builder receives the caller's opaque arg to fill buf. */
+static djl_err sh_send(djl_context *ctx, uint8_t player, djl_sock *sock,
+                       uint16_t port, const uint8_t *buf, size_t n)
+{
+    if (!n) return DJL_ERR_INVAL;
+    pthread_mutex_lock(&ctx->lock);
+    djl_slot_entry *t = roster_find(ctx, player);
+    if (!t) { pthread_mutex_unlock(&ctx->lock); return DJL_ERR_NOT_FOUND; }
+    unicast(ctx, sock, t->info.ip, port, buf, n);
+    pthread_mutex_unlock(&ctx->lock);
+    return DJL_OK;
+}
+
+djl_err djl_transport(djl_context *ctx, uint8_t player, djl_transport_op op, bool press)
+{
+    djl_err e = need_online(ctx);
+    if (e != DJL_OK) return e;
+    uint8_t buf[DJL_MAX_PACKET];
+    size_t n = djl_build_transport(buf, sizeof buf, &ctx->id, player,
+                                   (uint8_t)op, press, ctx->sh_corr);
+    return sh_send(ctx, player, &ctx->sock_beat, DJL_PORT_BEAT, buf, n);
+}
+
+djl_err djl_transport_play(djl_context *ctx, uint8_t player)
+{
+    /* Play is the paired 0x0f + 0x14 press the iPad sends together. */
+    djl_err e = djl_transport(ctx, player, DJL_TRANSPORT_PLAY, true);
+    if (e != DJL_OK) return e;
+    return djl_transport(ctx, player, DJL_TRANSPORT_PLAY2, true);
+}
+
+djl_err djl_transport_pause(djl_context *ctx, uint8_t player)
+{
+    return djl_transport(ctx, player, DJL_TRANSPORT_PLAY2, false);
+}
+
+djl_err djl_transport_skip(djl_context *ctx, uint8_t player, bool forward)
+{
+    djl_transport_op op = forward ? DJL_TRANSPORT_SKIP_FWD : DJL_TRANSPORT_SKIP_BACK;
+    djl_err e = djl_transport(ctx, player, op, true);
+    if (e != DJL_OK) return e;
+    return djl_transport(ctx, player, op, false);
+}
+
+djl_err djl_transport_seek(djl_context *ctx, uint8_t player, bool forward, bool press)
+{
+    djl_transport_op op = forward ? DJL_TRANSPORT_SEEK_FWD : DJL_TRANSPORT_SEEK_BACK;
+    return djl_transport(ctx, player, op, press);
+}
+
+djl_err djl_write_pref_on_air(djl_context *ctx, uint8_t player, bool on)
+{
+    djl_err e = need_online(ctx);
+    if (e != DJL_OK) return e;
+    uint8_t buf[DJL_MAX_PACKET];
+    size_t n = djl_build_pref_write(buf, sizeof buf, &ctx->id, player,
+                                    on ? 0x81 : 0x80, 0x00);
+    return sh_send(ctx, player, &ctx->sock_status, DJL_PORT_STATUS, buf, n);
+}
+
+djl_err djl_write_pref_quantize(djl_context *ctx, uint8_t player, uint8_t enum_index)
+{
+    djl_err e = need_online(ctx);
+    if (e != DJL_OK) return e;
+    if (enum_index > 0x7f) return DJL_ERR_INVAL;
+    uint8_t buf[DJL_MAX_PACKET];
+    size_t n = djl_build_pref_write(buf, sizeof buf, &ctx->id, player,
+                                    0x00, (uint8_t)(0x80 | enum_index));
+    return sh_send(ctx, player, &ctx->sock_status, DJL_PORT_STATUS, buf, n);
 }
 
 djl_err djl_set_tempo(djl_context *ctx, double bpm)

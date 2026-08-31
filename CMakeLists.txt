@@ -2,7 +2,8 @@ cmake_minimum_required(VERSION 3.16)
 # 0.x: the minor version carries ABI breaks, so it is part of the soname.
 # 0.2.0 grew djl_event (200 -> 256 bytes) by adding djl_rb_link to its union,
 # which is why the soname must change with it.
-project(libdjlink VERSION 0.4.0 LANGUAGES C)
+# 0.5.0 added the Stagehand persona: djl_config grew a bool, so the soname bumps.
+project(libdjlink VERSION 0.5.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -103,7 +104,7 @@ add_executable(djl-onelibrary tools/djl_onelibrary.c)
 target_link_libraries(djl-onelibrary PRIVATE djlink)
 
 enable_testing()
-add_executable(test_wire tests/test_wire.c tests/test_nfs.c tests/test_position.c tests/test_rblink.c tests/test_djm.c tests/test_onelibrary.c)
+add_executable(test_wire tests/test_wire.c tests/test_nfs.c tests/test_position.c tests/test_rblink.c tests/test_djm.c tests/test_onelibrary.c tests/test_stagehand.c)
 target_include_directories(test_wire PRIVATE tests ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(test_wire PRIVATE djlink)
 add_test(NAME wire COMMAND test_wire)

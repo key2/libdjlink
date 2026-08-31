@@ -97,6 +97,18 @@ size_t djl_build_sync_control(uint8_t *buf, size_t cap, const djl_identity *id, 
 /* DJM bridge: broadcast keepalive (50000) and per-DJM subscribe (50001). */
 size_t djl_build_bridge_keep_alive(uint8_t *buf, size_t cap, const djl_identity *id);
 size_t djl_build_bridge_subscribe(uint8_t *buf, size_t cap, const djl_identity *id);
+/* Stagehand persona: abbreviated handshake + keepalive (all broadcast, 50000).
+ * The keepalive carries the runtime device number in id->number; announce and
+ * claim carry the fixed symbolic number 0x3a on the wire. */
+size_t djl_build_stagehand_announce(uint8_t *buf, size_t cap, const djl_identity *id);
+size_t djl_build_stagehand_claim(uint8_t *buf, size_t cap, const djl_identity *id,
+                                 uint8_t n);
+size_t djl_build_stagehand_keep_alive(uint8_t *buf, size_t cap, const djl_identity *id);
+/* Stagehand remote control. transport -> port 50001, pref-write -> 50002. */
+size_t djl_build_transport(uint8_t *buf, size_t cap, const djl_identity *id,
+                           uint8_t target, uint8_t op, bool press, uint8_t corr);
+size_t djl_build_pref_write(uint8_t *buf, size_t cap, const djl_identity *id,
+                            uint8_t target, uint8_t on_air, uint8_t quantize);
 size_t djl_build_on_air(uint8_t *buf, size_t cap, const djl_identity *id,
                         uint8_t mask, bool six);
 size_t djl_build_fader_start(uint8_t *buf, size_t cap, const djl_identity *id,
@@ -116,6 +128,9 @@ typedef enum {
     DJL_ST_CLAIM1,
     DJL_ST_CLAIM2,
     DJL_ST_CLAIM3,
+    /* Stagehand persona abbreviated handshake (0x0a x3, then 0x02 x3). */
+    DJL_ST_SH_ANNOUNCE,
+    DJL_ST_SH_CLAIM,
     DJL_ST_ONLINE
 } djl_state;
 
@@ -210,6 +225,15 @@ struct djl_context {
     uint64_t        next_bridge_ka;
     uint64_t        next_bridge_sub;
     uint64_t        bridge_since_ms;
+
+    /* Stagehand persona (context.c). sh_number is the randomized runtime
+     * device number (141..211) drawn once at create; sh_corr is the per-session
+     * correlation byte stamped into transport commands. When cfg.stagehand is
+     * set the identity uses device type 0x05, model 0x20 and a randomized
+     * AlphaTheta-OUI MAC, and the handshake/keepalive use the Stagehand
+     * builders instead of the virtual-CDJ ones. */
+    uint8_t         sh_number;
+    uint8_t         sh_corr;
     /* Small per-mixer caches (a rig rarely has more than one DJM), each keyed
      * by device number and written under ctx->lock by the I/O thread. */
     struct { bool valid; uint8_t number; djl_djm_mixer m; } djm_mixer[4];

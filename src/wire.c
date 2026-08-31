@@ -726,10 +726,56 @@ const char *djl_slot_name(djl_slot s)
     case DJL_SLOT_SD:         return "SD";
     case DJL_SLOT_USB:        return "USB";
     case DJL_SLOT_COLLECTION: return "rekordbox";
+    case DJL_SLOT_STREAM5:    return "streaming";
     case DJL_SLOT_STREAM_DP:  return "StreamingDirectPlay";
-    case DJL_SLOT_USB2:       return "USB2";
+    case DJL_SLOT_STREAM7:    return "streaming";
+    case DJL_SLOT_STREAM8:    return "CloudDirectPlay";
     case DJL_SLOT_BEATPORT:   return "BeatportLINK";
     default:                  return "?";
+    }
+}
+
+bool djl_slot_is_streaming(djl_slot slot)
+{
+    switch (slot) {
+    case DJL_SLOT_STREAM5:
+    case DJL_SLOT_STREAM_DP:
+    case DJL_SLOT_STREAM7:
+    case DJL_SLOT_STREAM8:
+    case DJL_SLOT_BEATPORT:
+        return true;
+    default:
+        return false;
+    }
+}
+
+djl_streaming_source djl_streaming_source_of(djl_track_type type, djl_slot slot)
+{
+    /* A streaming track is flagged either by the streaming track type (0x06)
+     * or by one of the streaming slot ids; a few players set only one of the
+     * two, so accept either. Local media (rekordbox/USB/SD/CD) is never a
+     * streaming source. */
+    switch (slot) {
+    case DJL_SLOT_BEATPORT:  return DJL_STREAM_BEATPORT;
+    case DJL_SLOT_STREAM_DP: return DJL_STREAM_DIRECT_PLAY;
+    case DJL_SLOT_STREAM8:   return DJL_STREAM_CLOUD_DIRECT;
+    case DJL_SLOT_STREAM5:
+    case DJL_SLOT_STREAM7:   return DJL_STREAM_GENERIC;
+    default: break;
+    }
+    if (type == DJL_TRACK_STREAMING) return DJL_STREAM_GENERIC;
+    return DJL_STREAM_NONE;
+}
+
+const char *djl_streaming_source_name(djl_streaming_source s)
+{
+    switch (s) {
+    case DJL_STREAM_NONE:         return "none";
+    case DJL_STREAM_GENERIC:      return "streaming";
+    case DJL_STREAM_DIRECT_PLAY:  return "StreamingDirectPlay";
+    case DJL_STREAM_CLOUD_DIRECT: return "CloudDirectPlay";
+    case DJL_STREAM_BEATPORT:     return "BeatportLINK";
+    default:                      return "?";
     }
 }
 

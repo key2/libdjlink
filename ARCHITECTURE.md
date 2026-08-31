@@ -666,6 +666,69 @@ Pioneer Bridge capture (SuperTimecodeConverter was validated against one we do
 not have). The decoders and subscription ship regardless: they are correct
 against the documented layout and will produce data the moment a DJM sends it.
 
+### 1.14 Stagehand persona: mixer/VU push and CDJ remote control (2026-08-31)
+
+The bridge (§1.12) is not the only way to reach a DJM's `0x39`/`0x58` streams,
+and it turns out to be the wrong one for the DJM-A9. Pioneer's **Stagehand**
+iPad app receives the same data a *different* way: it joins the network as a
+new device type (`0x05`, "Stagehand"), and the A9 and CDJ-3000 then **push**
+their dense state to it **unsolicited** — there is no subscribe packet at all.
+libdjlink implements this persona (`cfg.stagehand`); it supersedes the virtual
+CDJ rather than adding a second identity.
+
+**The abbreviated handshake** (all broadcast on 50000). Where a CDJ runs
+`0x0a`×3 → `0x00`×3 → `0x02`×3 → `0x04`×3, Stagehand sends only `0x0a`×3 →
+`0x02`×3 at ~305 ms spacing, then `0x06` keep-alives every ~2 s. Distinguishing
+bytes, verified live and byte-for-byte against `alphatheta-connect`:
+
+- **Announce `0x0a`** (37 B): byte `0x21` = `0x03` (CDJ-3000-era marker), trailing
+  device-type byte `0x24` = `0x05`.
+- **Claim `0x02`** (50 B): IP at `0x24`, MAC at `0x28`, then byte `0x2e` = `0x3a`
+  (a *symbolic* device number, not the one it operates with), the 1..3 counter at
+  `0x2f`, device type `0x05` at `0x30`, `0x01` at `0x31`.
+- **Keep-alive `0x06`** (54 B): the **runtime** device number at `0x24` — a random
+  value in **141..211** drawn per launch, never the symbolic `0x3a` — `0x01` at
+  `0x25`, MAC at `0x26`, IP at `0x2c`, `01 00 00 00` at `0x30`, device type `0x05`
+  at `0x34`, **model code `0x20`** at `0x35`.
+
+The persona also uses a randomized **AlphaTheta-OUI MAC** (`c8:3d:fc:xx:xx:xx`)
+in its payloads, distinct from the host NIC MAC — the same dual-MAC behaviour the
+real iOS app shows.
+
+**Remote control** (Stagehand → device). Two command channels, ported from the
+dysentery `stagehand.adoc` single-control captures:
+
+- **Transport `0x07`** (56 B, port 50001): target CDJ number at the peer-marker
+  slot `0x1e`, `0x01` at `0x1f`, `0x03` at `0x20`, a per-session correlation byte
+  at `0x21`, `len_r` `0x0030` at `0x22`, sub-id `0x3a` at `0x28`, **action byte at
+  `0x2b`**, **press/release at `0x2d`**. Actions: `0x0f`/`0x14` play (paired),
+  `0x18`/`0x19` skip fwd/back, `0x1a`/`0x1b` seek fwd/back.
+- **Preference write `0x6b`** (124 B, port 50002): target at `0x1e`, `0x01` at
+  `0x1f`, `0x03` at `0x20`, sub-id `0x3a` at `0x21`, body length `0x0050` at
+  `0x22`, write flag `0x01` at `0x24`, **on-air display at `0x2c`** (`0x80` off,
+  `0x81` on), **quantize at `0x3c`** (`0x80 | index`).
+
+**Live finding (2026-08-31) — decisive, and it is not our code.** Against this
+rig's DJM-A9 (model `0xb1`, proto `0x02`), the persona was captured off the wire
+and confirmed byte-for-byte correct (announce/claim/keep-alive as above). Over a
+55-second session the A9 emitted **only** its normal `0x03` on-air (178×) and
+`0x06` keep-alive (27×) broadcasts — **zero `0x39`, zero `0x58`, zero unicast**
+to the Stagehand peer, and it never even ARP'd for the peer's IP. Crucially, the
+**reference `alphatheta-connect`** implementation (the third-party library the
+community reports *does* unlock this data) was then run in `connectMethod:
+'stagehand'` against the *same* A9 and got the identical result: `mixerState=0`,
+`vu=0`, no `0x39`/`0x58` (capture `captures/stagehand-reference-noresponse-20260831.pcap`).
+Two independent, byte-identical implementations both elicit nothing, so the
+blocker is a **device-side gate on this A9** — a Utility/PRO&nbsp;DJ&nbsp;LINK
+setting, a firmware level that does not serve Stagehand push, or a required
+one-time pairing with the genuine AlphaTheta app — not a protocol error in
+libdjlink. This is the same wall the `0xF9` bridge hit (§1.12), now proven to be
+the mixer's, by ruling out our implementation against the reference. The decoders
+(§1.12), the persona, and the remote-control builders all ship: they are correct
+and will produce data the moment a Stagehand-serving DJM is on the wire. To
+confirm this A9 can push at all, capture the genuine Pioneer Stagehand app (or
+AlphaTheta desktop) talking to it.
+
 ---
 
 ## 2. Layered architecture
@@ -1506,11 +1569,13 @@ live CDJ-3000X / DJM-A9 rig; **[built]** implemented, not yet hardware-verified;
 | rekordbox EXPORT NFS *server* (CDJs mount us) + UTF-16LE names | **[todo]** whole subsystem, see §1.11 | observed 2026-08-27 |
 | rekordbox link UDP control (`0x11`,`0x16`,`0x30`,`0x31`,`0x46`,`0x47`,`0x80`) | **[done]** all seven classified and decoded (subtype/device/len_r + per-kind payloads, host name UTF-16**BE**); 77/77 capture packets decode | measured first-hand, §1.11 |
 | Touch Audio (`0x1e`/`0x1f`/`0x20`) | **[built]** timing rx decoded (122k pkts seen); PCM **[todo]** | complete |
+| Streaming source detection (Beatport / Direct Play / Cloud Direct Play / generic) | **[done]** `djl_streaming_source_of` classifies the (track type, slot) pair; enum + names + unit test | slots 5/7/8 unnamed by AlphaTheta |
 | Streaming tracks (Beatport LINK, Cloud Direct Play) | metadata + waveforms; no grid/cues | protocol-limited |
-| DJM-A9 / V10 mixer state (`0x39`) | **[done]** full field decoder (all channels, master, FX, filter), unit-tested; **[built]** bridge subscription, but our A9 does not yet emit it (§1.12) | decoder complete; live elicitation blocked |
-| DJM VU stream (`0x58`) | **[done]** 15-segment ladders + peaks decoded, unit-tested; same bridge caveat | decoder complete; live elicitation blocked |
-| DJM bridge persona (`0xF9` keepalive + `0x57` subscribe) | **[built]** to the reference recipe; DJM-A9 receives it but sends no fader/VU back — needs a device setting or a real Pioneer Bridge capture | measured 2026-08-28, §1.12 |
-| Stagehand command surface (`0x3a`, `0x6b`, `0x07`) | implement the verified opcodes | partially decoded |
+| DJM-A9 / V10 mixer state (`0x39`) | **[done]** full field decoder (all channels, master, FX, filter), unit-tested; push unlocked via the Stagehand persona, but this A9 gates it (§1.14) | decoder complete; live elicitation gated by the mixer |
+| DJM VU stream (`0x58`) | **[done]** 15-segment ladders + peaks decoded, unit-tested; same device gate | decoder complete; live elicitation gated by the mixer |
+| Stagehand persona (`0x0a`/`0x02`/`0x06`, type `0x05`) | **[done]** implemented, golden-vector tested, and **proven byte-for-byte equal to the reference on the wire**; the DJM-A9 still emits no `0x39`/`0x58` — proven a device-side gate, not our code (§1.14) | persona correct; mixer gates the push |
+| DJM bridge persona (`0xF9` keepalive + `0x57` subscribe) | **[built]** to the reference recipe; superseded by the Stagehand persona, same A9 gate (§1.12, §1.14) | measured 2026-08-28 |
+| CDJ remote control: transport (`0x07`) + preference write (`0x6b`) | **[built]** `djl_transport_*` (play/pause/skip/seek) and `djl_write_pref_*` (on-air, quantize) to the dysentery byte map; not yet driven against a CDJ on this rig | opcodes from first-party captures |
 | CDJ-3000 `0x0b` unicast round-robin telemetry | expose raw sub-streams | 8 sub-types, **semantics unknown** |
 | `0x3d` track metadata push (2572 B) | decode the ~150 B that is known, expose raw | **mostly undecoded** |
 | `0x56` 316-byte reply | expose raw | **likely AES-CBC, key unknown** |

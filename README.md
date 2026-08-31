@@ -40,7 +40,10 @@ Verified against live hardware: 2 × `CDJ-3000X` (firmware 1.31) + `DJM-A9`.
 | **Beat-grid position interpolation** (pre-CDJ-3000 players) | **done, verified** (matches players' own beat numbers) |
 | **rekordbox LINK control channel** (7 undocumented 50002 kinds) | **done** (77/77 captured packets decode) |
 | **DJM-A9 / V10 mixer state (0x39) + VU meters (0x58) decoders** | **done** (full field/segment decode, unit-tested) |
-| **DJM bridge subscription** (0xF9 keepalive + 0x57 subscribe) | **built** to the reference recipe; our DJM-A9 receives it but sends no fader/VU back (see ARCHITECTURE.md 1.12) |
+| **Stagehand persona** (virtual iPad: type 0x05, model 0x20) | **built**, golden-vector tested, and **proven byte-for-byte equal to the reference on the wire** — but this DJM-A9 still pushes no 0x39/0x58, so the block is a device-side gate, not our code (ARCHITECTURE.md 1.14) |
+| **CDJ remote control** (transport 0x07, preference write 0x6b) | **built** — `djl_transport_*` (play/pause/skip/seek), `djl_write_pref_*` (on-air, quantize) |
+| **Streaming-source detection** (Beatport / Direct Play / Cloud Direct Play) | **done** (`djl_streaming_source_of`, unit-tested) |
+| **DJM bridge subscription** (0xF9 keepalive + 0x57 subscribe) | **built**; superseded by the Stagehand persona, same A9 gate (ARCHITECTURE.md 1.12/1.14) |
 | **Windows / macOS portability** | **Windows verified** under Wine incl. live rig; macOS written, uncompiled |
 | Tempo-master handoff dance, beat emission | partial |
 | Opus Quad / XDJ-AZ, Touch Audio PCM | not yet (Opus needs the hardware) |
@@ -76,7 +79,32 @@ Cross-compiling for Windows works with mingw-w64; link `ws2_32` and `iphlpapi`
 
 # query every media slot on every player
 ./build/djl-monitor -i eth0 -n 3 -M
+
+# join as a virtual Stagehand iPad to unlock DJM mixer state + VU meters
+./build/djl-monitor -i eth0 -S
 ```
+
+### Stagehand mode and CDJ remote control
+
+`cfg.stagehand` joins the network as a virtual **Stagehand** iPad (device type
+`0x05`) instead of a virtual CDJ. A Stagehand-serving DJM pushes its fader-status
+(`0x39`) and VU (`0x58`) streams unsolicited, surfaced as `DJL_EV_DJM_MIXER` /
+`DJL_EV_VU_METERS`. It also enables CDJ remote control:
+
+```c
+djl_transport_play(ctx, player);            /* 0x0f + 0x14 */
+djl_transport_pause(ctx, player);
+djl_transport_skip(ctx, player, true);      /* next track */
+djl_transport_seek(ctx, player, true, true);/* start search fwd; false = release */
+djl_write_pref_on_air(ctx, player, true);   /* toggle the on-air display */
+djl_write_pref_quantize(ctx, player, 1);    /* quantize index (0=1 beat, 1=1/2, ...) */
+```
+
+The persona is implemented to the dysentery `stagehand.adoc` byte map and was
+proven byte-for-byte identical on the wire to the reference `alphatheta-connect`.
+On this rig's DJM-A9 neither implementation elicits any `0x39`/`0x58`: the mixer
+gates the push (a firmware/Utility setting), so this is device-dependent — see
+`ARCHITECTURE.md` §1.14.
 
 ## NFS tool — read a player's USB/SD directly
 
@@ -171,7 +199,7 @@ made.
 
 ## Tests
 
-`tests/test_wire.c` — 433 assertions covering:
+`tests/test_wire.c` — 1067 assertions covering:
 
 - golden keep-alive vectors captured from real `CDJ-3000X` and `DJM-A9` hardware
 - a full 1152-byte `CDJ-3000X` status packet (`tests/vector_cdj3000x.h`)
@@ -186,6 +214,9 @@ made.
 - ANLZ beat-grid, cue and waveform fixtures, including sections whose declared
   lengths lie, plus a synthetic DeviceSQL page with a deleted row
 - real captured rekordbox LINK packets as golden vectors for all seven kinds
+- Stagehand persona handshake/keep-alive as **live-captured golden vectors**
+  (announce/claim/keep-alive), plus transport/pref-write byte-layout and
+  streaming-source classification tests
 - beat-grid position tracking: anchoring, jump correction, out-of-order beat
   packets, and the stopped-at-track-end regression
 - 50 000 fuzz iterations across all decoders and both file parsers
@@ -197,10 +228,10 @@ cmake -S . -B build-asan -DCMAKE_C_FLAGS="-fsanitize=address,undefined -g"
 cmake --build build-asan -j && ./build-asan/test_wire
 ```
 
-Clean under ASan+UBSan, including live NFS transfers and 1170 live packets from real
-hardware. The suite runs in four configurations: Linux release (851 checks), Linux
-ASan/UBSan (851), core with `DJL_WITH_NFS=OFF` (765), and Windows via mingw-w64 (851,
-executed under Wine).
+Clean under ASan+UBSan, including live NFS transfers and live packets from real
+hardware. The suite runs green in every configuration: Linux release (1067 checks),
+Linux ASan/UBSan (1067), and the `DJL_WITH_NFS=OFF` / `DJL_WITH_ONELIBRARY=OFF`
+cores.
 
 ## License
 

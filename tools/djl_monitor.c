@@ -194,6 +194,12 @@ static void handle(const djl_event *ev, djl_context *ctx)
         if (s->rekordbox_id)
             printf(" track=%u@p%u/%s", s->rekordbox_id, s->track_device,
                    djl_slot_name(s->track_slot));
+        {
+            djl_streaming_source src =
+                djl_streaming_source_of(s->track_type, s->track_slot);
+            if (src != DJL_STREAM_NONE)
+                printf(" stream=%s", djl_streaming_source_name(src));
+        }
         if (s->has_extended) print_key(s);
         if (s->firmware[0]) printf(" fw=%s", s->firmware);
         printf("\n");
@@ -312,6 +318,7 @@ static void usage(const char *argv0)
         "  -P <port>    restrict -X to one port\n"
         "  -M           query every media slot on every player once online\n"
         "  -D           act as a DJM bridge: subscribe + show mixer/VU\n"
+        "  -S           join as a virtual Stagehand iPad: unlock DJM mixer/VU\n"
         "  -t <sec>     run for N seconds then exit (default: until Ctrl-C)\n"
         "  -h           this help\n", argv0);
 }
@@ -323,8 +330,8 @@ int main(int argc, char **argv)
     unsigned model = 0x64;
 
     int opt;
-    int bridge = 0;
-    while ((opt = getopt(argc, argv, "i:n:N:m:oqspBvt:X:C:P:MDh")) != -1) {
+    int bridge = 0, stagehand = 0;
+    while ((opt = getopt(argc, argv, "i:n:N:m:oqspBvt:X:C:P:MDSh")) != -1) {
         switch (opt) {
         case 'i': iface = optarg; break;
         case 'n': number = atoi(optarg); break;
@@ -334,6 +341,7 @@ int main(int argc, char **argv)
         case 'q': quiet_status = 1; break;
         case 's': g_show_stat = 1; break;
         case 'D': bridge = 1; g_show_mixer = 1; break;
+        case 'S': stagehand = 1; g_show_mixer = 1; break;
         case 'p': g_show_pos = 1; break;
         case 'B': g_show_beat = 0; break;
         case 'v': g_verbose = 1; break;
@@ -355,6 +363,7 @@ int main(int argc, char **argv)
     djl_config_defaults(&cfg);
     cfg.interface_name = iface;
     if (name) cfg.device_name = name;
+    else if (stagehand) cfg.device_name = "Stagehand";
     if (number > 0) {
         cfg.preferred_number = (uint8_t)number;
         cfg.number_policy    = DJL_NUMBER_LOWEST_FREE;
@@ -363,6 +372,7 @@ int main(int argc, char **argv)
     cfg.observe_only = observe != 0;
     cfg.send_status  = !quiet_status && !observe;
     cfg.djm_bridge   = bridge != 0;
+    cfg.stagehand    = stagehand != 0;
     cfg.log          = logger;
     cfg.log_level    = g_verbose ? DJL_LOG_DEBUG : DJL_LOG_INFO;
 

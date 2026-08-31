@@ -1,3 +1,28 @@
+# Stagehand device gate — stagehand-reference-noresponse-20260831.pcap
+
+- **When:** 2026-08-31, ~24 s.
+- **Interface / rig:** as below (DJM-A9 `169.254.116.4` dev 33, two CDJ-3000X).
+- **What ran:** the **reference `alphatheta-connect`** library (chrisle) in
+  `connectMethod: 'stagehand'` mode — i.e. the exact third-party implementation
+  the community reports unlocks DJM fader/VU. It joined the network, saw the A9
+  (id 33) and both CDJs, and logged `mixerState=0 vu=0` for the whole run.
+- **What the A9 sent (this file):** only its normal broadcasts — `0x03` on-air
+  (75×) and `0x06` keep-alive (11×). **Zero `0x39`, zero `0x58`, zero unicast**
+  to the Stagehand peer, and no ARP for the peer's IP.
+
+**Conclusion (decisive).** libdjlink's Stagehand persona is byte-for-byte
+identical on the wire to this reference (verified live: `0x0a`/`0x02`/`0x06`
+with device type `0x05`, model `0x20`, proto marker `0x03`, symbolic `0x3a`,
+runtime number 141–211, AlphaTheta-OUI MAC). Both implementations elicit
+**nothing** from this DJM-A9. The blocker is therefore **not** our code — it is
+a device-side gate on this A9 (a Utility/`PRO DJ LINK` setting, a firmware
+level that lacks or gates the Stagehand push, or a required one-time pairing
+with the genuine AlphaTheta app). The same A9 also ignored the `0xF9` Pro DJ
+Link Bridge persona (§1.12). To confirm the A9 *can* push at all on this rig,
+run the genuine Pioneer Stagehand iPad app (or AlphaTheta desktop) against it
+and capture; if even that yields no `0x39`/`0x58`, the firmware simply does not
+serve it here.
+
 # Reference capture — reference-20260826-234257.pcap
 
 - **When:** 2026-08-26 23:42:57 local, ~8 min (requested 3 min; the `timeout`
