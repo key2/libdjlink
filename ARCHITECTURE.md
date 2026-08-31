@@ -786,12 +786,25 @@ Four distinct results, in order of confidence:
    true number from the roster (by the packet's name field) rather than trusting
    `0x21`.
 
-So on this rig the persona is correct and accepted (the CDJ serves it reliably,
-the A9 served it once), and the `0x39` decoder is proven against real A9 bytes;
-what remains device-dependent is *reliably* eliciting the A9 stream. The likely
-levers are the mixer's Utility/PRO&nbsp;DJ&nbsp;LINK settings or firmware level,
-or the genuine Pioneer Stagehand app holding the binding — capture that against
-this A9 and diff any pre-push exchange to find the election condition.
+So on this rig the persona is correct and accepted (the CDJ serves it, the A9
+served it once), and the `0x39` decoder is proven against real A9 bytes; what
+remains device-dependent is *reliably* eliciting the A9 stream and getting the
+CDJ to obey commands.
+
+**Lead for both gates — the `0x68` controller heartbeat.** dysentery notes the
+real Stagehand iPad continuously unicasts a 68-byte `0x68` "iPad → CDJ heartbeat"
+(body byte-stable, carries no command) alongside its `0x69` settings snapshots.
+Neither libdjlink nor the reference `alphatheta-connect` sends it — the reference
+fires `0x07`/`0x6b` cold. The A9's 164-byte binding table (which lists the mixer
+and both CDJs but *not* us) and this `0x68` heartbeat together suggest the gear
+only treats a Stagehand as an *active controller* — eligible to have its commands
+obeyed and, plausibly, to be pushed the dense streams — once it has seen that
+heartbeat register the peer. The heartbeat's exact bytes are undocumented and not
+in the reference, so capturing the genuine Stagehand app against this rig and
+lifting the `0x68`/`0x69` exchange is the concrete next step; implementing that
+heartbeat is the most likely thing that turns the correct-on-the-wire commands
+into deck actions and stabilises the DJM push. The mixer's Utility/PRO&nbsp;DJ&nbsp;LINK
+settings and firmware level are the other lever.
 
 Evidence: `captures/stagehand-a9-mixerstate-20260831.pcap` (the A9 actually
 pushing 147 `0x39`) and `captures/stagehand-reference-noresponse-20260831.pcap`
