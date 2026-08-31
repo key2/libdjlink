@@ -23,6 +23,8 @@ void djl_test_position(void);
 void djl_test_rblink(void);
 /* Implemented in test_djm.c: DJM mixer state + VU meters. */
 void djl_test_djm(void);
+/* Implemented in test_onelibrary.c: OneLibrary SQLCipher + reader. */
+void djl_test_onelibrary(void);
 
 #define CHECK(cond, ...) do {                            \
     checks++;                                            \
@@ -682,6 +684,7 @@ int main(void)
     djl_test_position();
     djl_test_rblink();
     djl_test_djm();
+    djl_test_onelibrary();
 
     printf("\n%d checks, %d failure(s)\n", checks, failures);
     return failures ? 1 : 0;

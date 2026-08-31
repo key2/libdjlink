@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.16)
 # 0.x: the minor version carries ABI breaks, so it is part of the soname.
 # 0.2.0 grew djl_event (200 -> 256 bytes) by adding djl_rb_link to its union,
 # which is why the soname must change with it.
-project(libdjlink VERSION 0.2.0 LANGUAGES C)
+project(libdjlink VERSION 0.4.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -27,6 +27,17 @@ find_package(Threads REQUIRED)
 # they are equally useful against a local rekordbox export archive.
 option(DJL_WITH_NFS "Build the NFS/portmap/mount client for reading player media" ON)
 
+# OneLibrary (exportLibrary.db) needs libsqlite3 for the SQL half; the SQLCipher
+# decryption is self-contained. Default ON when libsqlite3 is found.
+option(DJL_WITH_ONELIBRARY "Build the rekordbox OneLibrary (exportLibrary.db) reader" ON)
+if(DJL_WITH_ONELIBRARY)
+  find_package(SQLite3 QUIET)
+  if(NOT SQLite3_FOUND)
+    message(STATUS "libdjlink: SQLite3 not found, disabling DJL_WITH_ONELIBRARY")
+    set(DJL_WITH_ONELIBRARY OFF)
+  endif()
+endif()
+
 add_library(djlink
   src/wire.c
   src/osal.c
@@ -49,6 +60,19 @@ if(DJL_WITH_NFS)
   target_compile_definitions(djlink PUBLIC DJL_WITH_NFS=1)
 else()
   target_sources(djlink PRIVATE src/nfs/nfs_stub.c)
+endif()
+
+if(DJL_WITH_ONELIBRARY)
+  target_sources(djlink PRIVATE
+    src/onelibrary/sha512.c
+    src/onelibrary/aes.c
+    src/onelibrary/sqlcipher.c
+    src/onelibrary/onelibrary.c
+  )
+  target_compile_definitions(djlink PUBLIC DJL_WITH_ONELIBRARY=1)
+  target_link_libraries(djlink PRIVATE SQLite::SQLite3)
+else()
+  target_sources(djlink PRIVATE src/onelibrary/onelibrary_stub.c)
 endif()
 
 target_include_directories(djlink PUBLIC
@@ -75,11 +99,15 @@ target_link_libraries(djl-meta PRIVATE djlink)
 add_executable(djl-nfs tools/djl_nfs.c)
 target_link_libraries(djl-nfs PRIVATE djlink)
 
+add_executable(djl-onelibrary tools/djl_onelibrary.c)
+target_link_libraries(djl-onelibrary PRIVATE djlink)
+
 enable_testing()
-add_executable(test_wire tests/test_wire.c tests/test_nfs.c tests/test_position.c tests/test_rblink.c tests/test_djm.c)
+add_executable(test_wire tests/test_wire.c tests/test_nfs.c tests/test_position.c tests/test_rblink.c tests/test_djm.c tests/test_onelibrary.c)
 target_include_directories(test_wire PRIVATE tests ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(test_wire PRIVATE djlink)
 add_test(NAME wire COMMAND test_wire)
+configure_file(tests/data/exportLibrary.db ${CMAKE_CURRENT_BINARY_DIR}/tests/data/exportLibrary.db COPYONLY)
 
 set_target_properties(djlink PROPERTIES
   VERSION   ${PROJECT_VERSION}

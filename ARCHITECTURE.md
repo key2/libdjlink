@@ -571,6 +571,47 @@ from context.
   for reading CDJ USBs. This is the single largest capability gap surfaced by
   the capture.
 
+### 1.13 OneLibrary / Device Library Plus (`exportLibrary.db`) — implemented (2026-08-31)
+
+Alongside the DeviceSQL `export.pdb`, newer rekordbox writes `exportLibrary.db`
+(Device Library Plus, aka "OneLibrary") to the media. It is a **SQLCipher-4
+encrypted SQLite database**. The CDJ-3000 ignores it (it reads `export.pdb`); it
+is the primary library for the **OPUS-QUAD / OMNIS-DUO / XDJ-AZ**, which do *not*
+write `export.pdb` — so this is the only structured metadata source on those
+devices' media.
+
+Implemented as `DJL_WITH_ONELIBRARY` (`src/onelibrary/`): a self-contained
+SQLCipher-4 decryptor plus a reader that hands the plaintext to **libsqlite3**
+via `sqlite3_deserialize` (no temp file, no hand-rolled b-tree). Verified live:
+mount `/C/`, fetch `exportLibrary.db`, decrypt, and read track 33 identical to
+the `export.pdb` and dbserver paths.
+
+Measured facts, HMAC-verified against a real CDJ USB export:
+
+- **Encryption**: SQLCipher 4 defaults — 4096-byte pages, PBKDF2-HMAC-SHA512 ×
+  256000 for the AES key, a 2-iteration PBKDF2 over `salt XOR 0x3a` for the HMAC
+  key, AES-256-CBC per page, HMAC-SHA512 per page over
+  `ciphertext || iv || page_no(LE32)`. Page 1's first 16 bytes are the KDF salt
+  in place of the `SQLite format 3\0` magic; the reserved 80 bytes at each page
+  end hold the IV (16) and HMAC (64).
+- **Key**: not machine- or license-specific — a single constant shared by every
+  Device Library Plus export. It deobfuscates (base85 → XOR `657f48f84c437cc1`
+  → zlib) to the 64-character ASCII passphrase beginning `r8gd…`, which we embed
+  directly (so no base85/zlib is needed at runtime). The passphrase is run
+  through PBKDF2, not used as a raw key.
+- **Schema** mirrors rekordbox's `master.db`: `content` (bpmx100, length, path,
+  `analysisDataFilePath`, foreign keys) joined to `artist`, `album`, `genre`,
+  `key`, `label`, `color`, `image`. 22 tables in the test export; 40 `content`
+  rows matching the 40 tracks in `export.pdb`.
+
+The one hard caveat from the community — that rekordbox uses *non-default*
+cipher parameters — turned out to concern *writing*; **reading** works with
+standard SQLCipher-4 parameters, which our HMAC check confirms page by page.
+
+The auto-fetch NFS path prefers `export.pdb` and falls back to `exportLibrary.db`
+when the media has none, so OPUS-family media resolves through the same code
+that already reads the ANLZ files (whose paths OneLibrary records too).
+
 ### 1.12 DJM mixer state (`0x39`) / VU meters (`0x58`) and the bridge (2026-08-28)
 
 A DJM does not broadcast its fader positions or VU meters. It unicasts them only
@@ -1459,6 +1500,7 @@ live CDJ-3000X / DJM-A9 rig; **[built]** implemented, not yet hardware-verified;
 | Song structure (`PSSI`) phrases + deobfuscation | **[done]** **verified live over NFS** (13 phrases, mood=high, XOR mask exercised); dbserver `0x2c04` reports it unavailable for the same track | complete |
 | Vocal config (`PWVC`) | **[todo]** observed live (8-byte body) but the published field reading does not match; see §1.8.1 | **doc disagrees with hardware** |
 | NFS + `export.pdb` + ANLZ | **[done]** full client: portmap/mount/NFSv2, DeviceSQL reader with cross-table names, PMAI walker. Verified live: mount `/C/`, 212992-byte `export.pdb`, 40 tracks, track 33 grid+cues+phrases+waveforms | complete |
+| OneLibrary `exportLibrary.db` (SQLCipher) | **[done]** self-contained SQLCipher-4 decrypt (SHA-512/HMAC/PBKDF2/AES-256, KAT-tested) + libsqlite3 reader; NFS glue + OPUS fallback. Verified live: decrypt + read track 33 identical to PDB/dbserver (§1.13) | complete |
 | Device Library Plus (`exportLibrary.db`) | parse if a key is supplied | **encrypted; key not public** |
 | Opus Quad / XDJ-AZ via rekordbox-Lighting + PSSI matching | **[todo]** step 10 | mostly complete |
 | rekordbox EXPORT NFS *server* (CDJs mount us) + UTF-16LE names | **[todo]** whole subsystem, see §1.11 | observed 2026-08-27 |

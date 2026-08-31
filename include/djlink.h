@@ -54,9 +54,11 @@ DJL_API uint64_t djl_now_ms(void);
  * the library soname, so a stale shared library cannot be loaded silently.
  * 0.2.0 grew djl_event from 200 to 256 bytes (djl_rb_link joined its union).
  * 0.3.0 added the DJM bridge: new config fields, event kinds and decoders (the
- * djl_event union did not grow, but djl_config did). */
+ * djl_event union did not grow, but djl_config did).
+ * 0.4.0 added the OneLibrary (exportLibrary.db) reader: new functions only, no
+ * struct changes, so it is ABI-compatible with 0.3. */
 #define DJL_VERSION_MAJOR  0
-#define DJL_VERSION_MINOR  3
+#define DJL_VERSION_MINOR  4
 #define DJL_VERSION_PATCH  0
 
 #define DJL_NAME_LEN       0x14   /* 20 */
@@ -979,6 +981,43 @@ DJL_API djl_err djl_pdb_artwork_path(const djl_pdb *p, uint32_t artwork_id,
                                      char *out, size_t outsz);
 
 /* ------------------------------------------------------------------ */
+/* OneLibrary reader: rekordbox Device Library Plus (exportLibrary.db) */
+/* ------------------------------------------------------------------ */
+
+/* exportLibrary.db is the SQLCipher-encrypted "Device Library Plus" database
+ * rekordbox writes for the OPUS-QUAD / OMNIS-DUO / XDJ-AZ, which do not write
+ * export.pdb. This reader decrypts it (the key is a published constant shared
+ * by all such exports) and reads it with SQLite. Built only with
+ * DJL_WITH_ONELIBRARY; otherwise every call returns DJL_ERR_UNAVAILABLE. */
+
+typedef struct djl_onelibrary djl_onelibrary;
+
+/* False if the library was built without DJL_WITH_ONELIBRARY. */
+DJL_API bool djl_onelibrary_supported(void);
+
+/* Decrypt a raw exportLibrary.db image into a plaintext SQLite image (which any
+ * SQLite tool can then open). *out is heap-allocated; free with djl_blob_free.
+ * Returns DJL_ERR_STATE if the per-page HMAC does not verify. */
+DJL_API djl_err djl_onelibrary_decrypt(const uint8_t *enc, size_t len, djl_blob *out);
+
+/* Open a exportLibrary.db image (decrypts internally). The bytes are copied in,
+ * so enc need not outlive the call. */
+DJL_API djl_err djl_onelibrary_open(const uint8_t *enc, size_t len, djl_onelibrary **out);
+DJL_API void    djl_onelibrary_close(djl_onelibrary *o);
+
+DJL_API size_t  djl_onelibrary_track_count(const djl_onelibrary *o);
+DJL_API djl_err djl_onelibrary_track_id_at(const djl_onelibrary *o, size_t index,
+                                           uint32_t *out_id);
+
+/* Full metadata for one content id, cross-table names resolved. If anlz_path is
+ * non-NULL it receives the analysis (.DAT) path recorded for the track. */
+DJL_API djl_err djl_onelibrary_track(const djl_onelibrary *o, uint32_t content_id,
+                                     djl_track_info *out, char *anlz_path, size_t anlz_path_sz);
+
+DJL_API djl_err djl_onelibrary_artwork_path(const djl_onelibrary *o, uint32_t artwork_id,
+                                            char *out, size_t outsz);
+
+/* ------------------------------------------------------------------ */
 /* NFS client: read a player's own USB/SD directly (DJL_WITH_NFS)       */
 /* ------------------------------------------------------------------ */
 
@@ -1011,6 +1050,12 @@ DJL_API djl_err djl_nfs_list_dir(djl_nfs *n, const char *path,
 /* The slot's export.pdb, downloaded and parsed on first use, then cached in
  * the handle. The returned reader stays owned by the handle. */
 DJL_API djl_err djl_nfs_pdb(djl_nfs *n, const djl_pdb **out);
+
+/* The slot's exportLibrary.db (OneLibrary), downloaded, decrypted and opened on
+ * first use, then cached in the handle. DJL_ERR_UNAVAILABLE if the library was
+ * built without DJL_WITH_ONELIBRARY, DJL_ERR_NOT_FOUND if the media has no
+ * exportLibrary.db (i.e. a plain rekordbox-USB export). Owned by the handle. */
+DJL_API djl_err djl_nfs_onelibrary(djl_nfs *n, const djl_onelibrary **out);
 
 typedef struct {
     bool     has_meta;

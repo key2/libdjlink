@@ -33,6 +33,7 @@ struct djl_nfs {
 
     djl_blob  pdb_raw;           /* cached export.pdb bytes */
     djl_pdb  *pdb;               /* parsed view over pdb_raw */
+    djl_onelibrary *onelib;      /* cached exportLibrary.db reader (owns its bytes) */
 };
 
 bool djl_nfs_supported(void) { return true; }
@@ -117,6 +118,7 @@ void djl_nfs_close(djl_nfs *n)
     if (!n) return;
     if (n->mounted) djl_mount_umnt(&n->rpc, n->mount_port, n->mount_path);
     djl_pdb_close(n->pdb);
+    djl_onelibrary_close(n->onelib);
     djl_blob_free(&n->pdb_raw);
     djl_rpc_close(&n->rpc);
     free(n);
@@ -251,6 +253,29 @@ djl_err djl_nfs_pdb(djl_nfs *n, const djl_pdb **out)
     return DJL_OK;
 }
 
+djl_err djl_nfs_onelibrary(djl_nfs *n, const djl_onelibrary **out)
+{
+    if (!n || !out) return DJL_ERR_INVAL;
+    *out = NULL;
+    if (!djl_onelibrary_supported()) return DJL_ERR_UNAVAILABLE;
+    if (n->onelib) { *out = n->onelib; return DJL_OK; }
+
+    djl_blob raw;
+    djl_err e = djl_nfs_read_file(n, "PIONEER/rekordbox/exportLibrary.db", &raw);
+    if (e != DJL_OK) return e;
+
+    /* djl_onelibrary_open copies what it needs (it decrypts into its own
+     * buffer), so the encrypted bytes can be released immediately. */
+    djl_onelibrary *o = NULL;
+    e = djl_onelibrary_open(raw.data, raw.length, &o);
+    djl_blob_free(&raw);
+    if (e != DJL_OK) return e;
+
+    n->onelib = o;
+    *out = o;
+    return DJL_OK;
+}
+
 /* ---------------- one track, end to end ---------------- */
 
 /* Swap the extension of an ANLZ path, e.g. ANLZ0000.DAT -> ANLZ0000.EXT. */
@@ -270,14 +295,26 @@ djl_err djl_nfs_fetch_track(djl_nfs *n, uint32_t track_id, djl_nfs_track *out)
     if (!n || !out || track_id == 0) return DJL_ERR_INVAL;
     memset(out, 0, sizeof *out);
 
+    char dat[512] = {0};
+
+    /* Resolve metadata and the analysis path from export.pdb, falling back to
+     * the encrypted OneLibrary database when the media has no export.pdb -- as
+     * the OPUS-QUAD / OMNIS-DUO / XDJ-AZ do. Either way the ANLZ files below are
+     * read the same way. */
     const djl_pdb *p = NULL;
     djl_err e = djl_nfs_pdb(n, &p);
-    if (e != DJL_OK) return e;
-
-    char dat[512];
-    e = djl_pdb_track(p, track_id, &out->meta, dat, sizeof dat);
-    if (e != DJL_OK) return e;
-    out->has_meta = out->meta.found;
+    if (e == DJL_OK) {
+        e = djl_pdb_track(p, track_id, &out->meta, dat, sizeof dat);
+        if (e != DJL_OK) return e;
+        out->has_meta = out->meta.found;
+    } else {
+        const djl_onelibrary *ol = NULL;
+        djl_err oe = djl_nfs_onelibrary(n, &ol);
+        if (oe != DJL_OK) return e;                  /* neither source available */
+        oe = djl_onelibrary_track(ol, track_id, &out->meta, dat, sizeof dat);
+        if (oe != DJL_OK) return oe;
+        out->has_meta = out->meta.found;
+    }
     out->meta.slot = n->slot;
     out->meta.type = DJL_TRACK_REKORDBOX;
     snprintf(out->anlz_path, sizeof out->anlz_path, "%s", dat);

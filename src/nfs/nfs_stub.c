@@ -51,6 +51,13 @@ djl_err djl_nfs_pdb(djl_nfs *n, const djl_pdb **out)
     return DJL_ERR_UNAVAILABLE;
 }
 
+djl_err djl_nfs_onelibrary(djl_nfs *n, const djl_onelibrary **out)
+{
+    (void)n;
+    if (out) *out = NULL;
+    return DJL_ERR_UNAVAILABLE;
+}
+
 djl_err djl_nfs_fetch_track(djl_nfs *n, uint32_t track_id, djl_nfs_track *out)
 {
     (void)n; (void)track_id; (void)out;

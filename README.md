@@ -35,6 +35,7 @@ Verified against live hardware: 2 × `CDJ-3000X` (firmware 1.31) + `DJM-A9`.
 | **Auto-fetch metadata on load** (worker + cache + events) | **done, verified** |
 | **NFS client (portmap / mount / NFSv2, UTF-16LE)** | **done, verified** on CDJ-3000X USB |
 | **DeviceSQL `export.pdb` reader** | **done, verified** (40-track collection, cross-table names) |
+| **OneLibrary `exportLibrary.db` reader** (SQLCipher-4 + SQLite) | **done, verified live** (decrypt + read; matches PDB/dbserver) — unlocks OPUS/OMNIS/XDJ-AZ media |
 | **ANLZ `.DAT`/`.EXT`/`.2EX` walker** | **done, verified** (grid, cues, phrases, waveforms) |
 | **Beat-grid position interpolation** (pre-CDJ-3000 players) | **done, verified** (matches players' own beat numbers) |
 | **rekordbox LINK control channel** (7 undocumented 50002 kinds) | **done** (77/77 captured packets decode) |
@@ -53,11 +54,16 @@ cmake --build build -j
 ctest --test-dir build
 ```
 
-No dependencies beyond libc, pthreads and libm. The NFS client is on by default and
-can be compiled out with `-DDJL_WITH_NFS=OFF`, which leaves a core that needs no
-sockets beyond the four DJ Link ports (useful for embedded targets).
+No dependencies beyond libc, pthreads and libm, except the optional OneLibrary
+reader, which links **libsqlite3**. The NFS client is on by default and can be
+compiled out with `-DDJL_WITH_NFS=OFF`, which leaves a core that needs no sockets
+beyond the four DJ Link ports (useful for embedded targets). The OneLibrary
+(`exportLibrary.db`) reader is on when libsqlite3 is found; turn it off with
+`-DDJL_WITH_ONELIBRARY=OFF`. Its SQLCipher-4 decryption is self-contained, so
+only the SQL half needs libsqlite3.
 
-Cross-compiling for Windows works with mingw-w64; link `ws2_32` and `iphlpapi`.
+Cross-compiling for Windows works with mingw-w64; link `ws2_32` and `iphlpapi`
+(build with `-DDJL_WITH_ONELIBRARY=OFF` unless a Windows libsqlite3 is available).
 
 ## Monitor tool
 
